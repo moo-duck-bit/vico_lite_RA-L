@@ -118,12 +118,10 @@ class Challenge:
                 prev_goal_count = local_finish[0]
                 while not done:
                     step_num += 1
-                    # 개선: 프레임 대신 스텝으로 종료 조건 체크 (3000 스텝)
-                    if step_num > self.max_frames:
-                        self.logger.info(f"Episode {episode} reached max_steps={self.max_frames} at step {step_num}, forcing finish")
+                    if step_num > self.max_frames * 10:
+                        self.logger.info(f"Episode {episode} reached safety step limit at step {step_num}, forcing finish")
                         done = True
                         local_finish = self.env.check_goal()
-                        self.logger.info(f"Episode {episode} done at step {step_num} (max_steps reached), final check_goal: {local_finish}, frame: {self.env.num_frames}")
                         break
                     actions = {}
                     if self.save_img: self.env.save_images(os.path.join(self.output_dir, str(episode), 'Images'))
@@ -252,7 +250,7 @@ def main():
     parser.add_argument("--port", default=1071, type=int)
     parser.add_argument("--agents", nargs='+', type=str, default=("h_agent",))
     parser.add_argument("--eval_episodes", nargs='+', default=(-1,), type=int, help="which episodes to evaluate on")
-    parser.add_argument("--max_frames", default=3000, type=int, help="max steps per episode (changed from frames to steps)")
+    parser.add_argument("--max_frames", default=3000, type=int, help="max frames per episode (TDW frame count)")
     parser.add_argument("--no_launch_build", action='store_true')
     parser.add_argument("--communication", action='store_true')
     parser.add_argument("--debug", action='store_true')
@@ -275,6 +273,7 @@ def main():
     parser.add_argument("--screen_size", default=512, type=int)
     parser.add_argument("--no_save_img", action='store_true', help="do not save images", default=False)
     parser.add_argument("--stop_on_first_success", action='store_true', help="end episode after first object reaches goal")
+    parser.add_argument("--symbolic_top_k", default=None, type=int, help="override ViCoConfig.symbolic_top_k (Top-K ablation)")
     args = parser.parse_args()
 
     args.number_of_agents = len(args.agents)
@@ -295,7 +294,11 @@ def main():
             agents.append(lm_agent(i, logger, args.max_frames, args, args.output_dir))
         elif agent == 'vico_agent':
             if shared_vico_hub is None:
-                shared_vico_hub = TeamMemoryHub(ViCoConfig())
+                vico_cfg = ViCoConfig()
+                if args.symbolic_top_k is not None:
+                    vico_cfg.symbolic_top_k = args.symbolic_top_k
+                    logger.info(f"[Config] symbolic_top_k overridden to {args.symbolic_top_k}")
+                shared_vico_hub = TeamMemoryHub(vico_cfg)
             agents.append(
                 ViCoAgent(
                     i,

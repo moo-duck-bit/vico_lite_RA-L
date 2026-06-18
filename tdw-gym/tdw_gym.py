@@ -1365,9 +1365,7 @@ class TDW(Env):
         self.num_step += 1        
         self.reward += reward
         done = False
-        # 주의: challenge.py에서 step 기반 종료를 관리하므로, 여기서는 frame 체크를 비활성화
-        # if self.num_frames >= self.max_frame or self.success:
-        if self.success:  # success 체크만 유지
+        if self.num_frames >= self.max_frame or self.success:
             done = True
             self.done = True
         

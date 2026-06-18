@@ -169,7 +169,7 @@ class PlanExecutor:
             # Force continuous navigation for deliver to avoid guard blocking
             # Use arrived_at (2.5m) for deliver to ensure we get close enough for put_in
             # 프레임 절약을 위해 arrived_at을 조금 크게 설정 (2.0m -> 2.5m)
-            arrived_at = 1.2  # Stop closer to bed so put_in / screen recording looks correct
+            arrived_at = 2.5  # Restored to original value; ablation succeeded at dist=2.46
             action = {
                 "type": 9,  # Continuous movement
                 "target_position": target_pos,
