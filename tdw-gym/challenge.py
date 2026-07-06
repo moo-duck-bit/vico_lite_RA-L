@@ -37,8 +37,8 @@ def _obs_has_put_in_success(state: dict) -> bool:
 
 
 class Challenge:
-    def __init__(self, logger, port, data_path, output_dir, number_of_agents = 2, max_frames = 3000, launch_build = True, screen_size = 512, data_prefix = 'dataset/nips_dataset/', gt_mask = True, save_img = True, stop_on_first_success = False):
-        self.env = gym.make("transport_challenge_MA", port = port, number_of_agents = number_of_agents, save_dir = output_dir, max_frames = max_frames, launch_build = launch_build, screen_size = screen_size, data_prefix = data_prefix, gt_mask = gt_mask, logger = logger, save_frame_images = save_img)
+    def __init__(self, logger, port, data_path, output_dir, number_of_agents = 2, max_frames = 3000, launch_build = True, screen_size = 512, data_prefix = 'dataset/nips_dataset/', gt_mask = True, save_img = True, stop_on_first_success = False, seg_dropout = 0.0):
+        self.env = gym.make("transport_challenge_MA", port = port, number_of_agents = number_of_agents, save_dir = output_dir, max_frames = max_frames, launch_build = launch_build, screen_size = screen_size, data_prefix = data_prefix, gt_mask = gt_mask, logger = logger, save_frame_images = save_img, seg_dropout = seg_dropout)
         self.gt_mask = gt_mask
         self.logger = logger
         self.logger.debug(port)
@@ -255,6 +255,7 @@ def main():
     parser.add_argument("--communication", action='store_true')
     parser.add_argument("--debug", action='store_true')
     parser.add_argument("--no_gt_mask", action='store_true')
+    parser.add_argument("--seg_dropout", default=0.0, type=float, help="randomly drop fraction P of visible objects each frame (perception-strength ablation; 0=full, 1=blind)")
     # LLM parameters
     parser.add_argument('--source', default='openai',
         choices=['hf', 'openai'],
@@ -274,6 +275,10 @@ def main():
     parser.add_argument("--no_save_img", action='store_true', help="do not save images", default=False)
     parser.add_argument("--stop_on_first_success", action='store_true', help="end episode after first object reaches goal")
     parser.add_argument("--symbolic_top_k", default=None, type=int, help="override ViCoConfig.symbolic_top_k (Top-K ablation)")
+    parser.add_argument("--clip_object_ranking", action='store_true', default=False, help="enable per-object CLIP image-name ranking so symbolic_top_k (K) is meaningful (Top-K ablation)")
+    parser.add_argument("--w_d", default=None, type=float, help="override live heuristic weight: distance (reasoner_heuristic_weights['distance'])")
+    parser.add_argument("--w_n", default=None, type=float, help="override live heuristic weight: novelty")
+    parser.add_argument("--w_v", default=None, type=float, help="override live heuristic weight: visibility")
     args = parser.parse_args()
 
     args.number_of_agents = len(args.agents)
@@ -284,7 +289,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok = True)
     logger = init_logs(args.output_dir)
 
-    challenge = Challenge(logger, args.port, args.data_path, args.output_dir, args.number_of_agents, args.max_frames, not args.no_launch_build, screen_size = args.screen_size, data_prefix=args.data_prefix, gt_mask = not args.no_gt_mask, save_img = not args.no_save_img, stop_on_first_success = args.stop_on_first_success)
+    challenge = Challenge(logger, args.port, args.data_path, args.output_dir, args.number_of_agents, args.max_frames, not args.no_launch_build, screen_size = args.screen_size, data_prefix=args.data_prefix, gt_mask = not args.no_gt_mask, save_img = not args.no_save_img, stop_on_first_success = args.stop_on_first_success, seg_dropout = args.seg_dropout)
     agents = []
     shared_vico_hub: Optional[TeamMemoryHub] = None
     for i, agent in enumerate(args.agents):
@@ -298,6 +303,9 @@ def main():
                 if args.symbolic_top_k is not None:
                     vico_cfg.symbolic_top_k = args.symbolic_top_k
                     logger.info(f"[Config] symbolic_top_k overridden to {args.symbolic_top_k}")
+                if args.clip_object_ranking:
+                    vico_cfg.clip_object_ranking = True
+                    logger.info("[Config] clip_object_ranking ENABLED (per-object CLIP top-K ranking)")
                 shared_vico_hub = TeamMemoryHub(vico_cfg)
             agents.append(
                 ViCoAgent(

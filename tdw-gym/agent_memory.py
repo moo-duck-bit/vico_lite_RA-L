@@ -269,10 +269,12 @@ class AgentMemory():
         xx = (xx - cx) / fx * depth
         yy = (yy - cy) / fy * depth
 
-        # COELA-style: Use 10m depth limit (same as COELA's h_agent and lm_agent)
-        # Depth accuracy degrades significantly beyond 10m, leading to incorrect position calculations
-        # COELA uses hardcoded depth < 10, we use max_depth = 10.0 for consistency
-        max_depth = 10.0  # COELA-style: 10m limit (no extension)
+        # FIX(2026-06-20): depth 한도를 10m→25m로 확대.
+        # smoke6 진단: 픽셀 수십~수백 개(26/44/358)로 또렷이 보이는 객체도
+        # matched_depth가 12~19m라 10m 컷오프에 전부 걸려 valid_count=0 → 위치
+        # 계산 실패 → no_position → 집기 0 → TR 0. 또렷이 보이는 객체를 멀리서도
+        # localize해 접근할 수 있도록 한도를 넓힌다. (정확도 저하는 접근하며 자연히 보정)
+        max_depth = 25.0
         index = np.where((depth > 0) & (depth < max_depth))
         valid_count = len(index[0])
         
@@ -374,14 +376,16 @@ class AgentMemory():
             
             # 포인트 수에 따라 신뢰도 조정
             confidence = 1.0
-            if pc is None or pc.shape[1] < 3:
-                # 3개 미만: 실패
+            if pc is None or pc.shape[1] < 1:
+                # FIX(2026-06-20): 점 0개만 실패 처리(이전엔 <3 실패).
+                # 작은 task object(orange/bread)는 멀리서 1-2픽셀만 잡혀 전부
+                # 실패→no_position→집기 0이었다. 1-2점은 아래서 저신뢰로 허용.
                 if hasattr(self, 'logger') and self.logger:
                     if not hasattr(self, '_logged_failed_objects'):
                         self._logged_failed_objects = set()
                     if obj_id not in self._logged_failed_objects:
                         self.logger.debug(
-                            "[AgentMemory] cal_object_position failed: id=%s name=%s pc_shape=%s (need at least 3 points)",
+                            "[AgentMemory] cal_object_position failed: id=%s name=%s pc_shape=%s (need at least 1 point)",
                             obj_id,
                             o_dict.get('name'),
                             pc.shape if pc is not None else None,
@@ -407,6 +411,11 @@ class AgentMemory():
                         return last_known_position, None, 0.5
                 
                 return None, None, 0.0
+            elif pc.shape[1] < 3:
+                # FIX(2026-06-20): 1-2개 점은 매우 낮은 신뢰도로 허용.
+                # 거친 위치라도 줘서 멀리 있는 작은 음식에 접근(navigation)을
+                # 시작할 수 있게 한다. 접근하며 픽셀이 늘면 위치가 자연히 보정됨.
+                confidence = 0.3
             elif pc.shape[1] < 5:
                 # 3-4개 포인트: 낮은 신뢰도로 허용
                 confidence = 0.5
@@ -1084,7 +1093,20 @@ class AgentMemory():
             idx = min(int(len(points) * 3 / 4), len(points) - 1)
             curr_x, curr_z = points[idx][1], points[idx][2]
 
+        # FIX(2026-06-20): 무한 루프 방지 상한. 도달 가능한 미탐색 프론티어가
+        # 없으면(모든 랜덤 셀이 obstacle_distance>EXPLORE_MAX_COST 거나 너무 가까움)
+        # 이 루프가 find_shortest_path(A*)를 영원히 돌려 episode가 hang된다
+        # (smoke5: frame 191에서 137% CPU 스핀으로 40분+ 고착). 상한 도달 시
+        # RuntimeError를 던져 호출측(policy._ensure_plan_target)의 try/except가
+        # 받아 spiral-search fallback으로 넘기도록 한다.
+        MAX_RANDOM_TRIES = 200
+        random_tries = 0
         while curr_x is None:
+            random_tries += 1
+            if random_tries > MAX_RANDOM_TRIES:
+                raise RuntimeError(
+                    "explore(): no reachable unexplored frontier after %d tries" % MAX_RANDOM_TRIES
+                )
             # if we can't find a place, we randomly choose a place
             explore_target = np.where(np.ones_like(self.known_map, dtype=bool))
             idx = random.randint(0, explore_target[0].shape[0] - 1)
