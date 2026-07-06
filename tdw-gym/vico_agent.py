@@ -29,6 +29,20 @@ class ViCoAgent:
         self.output_dir = output_dir
         self.device = device
         self.cfg = ViCoConfig()
+        # CLI/args 오버라이드를 perception이 실제 사용하는 cfg에 반영.
+        # (원본/팀원 코드는 hub의 cfg에만 적용돼 perception 파이프라인엔 안 닿았음)
+        if args is not None:
+            stk = getattr(args, "symbolic_top_k", None)
+            if stk is not None:
+                self.cfg.symbolic_top_k = stk
+            if getattr(args, "clip_object_ranking", False):
+                self.cfg.clip_object_ranking = True
+            # 라이브 heuristic scoring 가중치 오버라이드 (robustness ablation용).
+            # _score_candidate(reasoner.py)가 self.cfg.reasoner_heuristic_weights를 읽음.
+            for _argname, _key in (("w_d", "distance"), ("w_n", "novelty"), ("w_v", "visibility")):
+                _val = getattr(args, _argname, None)
+                if _val is not None:
+                    self.cfg.reasoner_heuristic_weights[_key] = float(_val)
         self.map_size = (240, 120)
         self.scene_bounds = {
             "x_min": -15.0,

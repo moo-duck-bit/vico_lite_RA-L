@@ -7,6 +7,7 @@ import numpy as np
 import os
 import time
 import copy
+import random
 
 from tdw.replicant.arm import Arm
 from tdw.tdw_utils import TDWUtils
@@ -50,7 +51,7 @@ def might_fail_launch(launch, port = None):
 
 class TDW(Env):
     def __init__(self, port = 1071, number_of_agents = 1, demo=False, rank=0, num_scenes = 0, train=False, \
-                        screen_size = 512, exp = False, launch_build=True, gt_occupancy = False, gt_mask = True, enable_collision_detection = False, save_dir = 'results', max_frames = 3000, data_prefix = 'dataset/nips_dataset/', logger=None, save_frame_images = True):
+                        screen_size = 512, exp = False, launch_build=True, gt_occupancy = False, gt_mask = True, enable_collision_detection = False, save_dir = 'results', max_frames = 3000, data_prefix = 'dataset/nips_dataset/', logger=None, save_frame_images = True, seg_dropout = 0.0):
         self.messages = None
         self.data_prefix = data_prefix
         self.replicant_colors = None
@@ -63,6 +64,9 @@ class TDW(Env):
         self.object_manager = None
         self.occupancy_map = None
         self.gt_mask = gt_mask
+        # Perception ablation: 가시 객체를 매 프레임 확률 P로 무작위 누락(약한 perception 시뮬레이션).
+        self.seg_dropout = float(seg_dropout)
+        self._seg_rng = random.Random(12345)  # 재현성용 고정 시드
         self.satisfied = None
         self.count = 0
         self.reach_threshold = 2
@@ -159,21 +163,40 @@ class TDW(Env):
         self.save_frame_images = save_frame_images
     
     def obs_filter(self, obs):
-        if self.gt_mask:
-            return obs
-        else:
+        if not self.gt_mask:
+            # 완전 실명: seg_mask 0, visible_objects 비움 (강한 perception의 반대 극단)
             new_obs = copy.deepcopy(obs)
             for agent in obs:
                 new_obs[agent]['seg_mask'] = np.zeros_like(new_obs[agent]['seg_mask'])
                 new_obs[agent]['visible_objects'] = []
                 while len(new_obs[agent]['visible_objects']) < 50:
                     new_obs[agent]['visible_objects'].append({
-                        'id': None,
-                        'type': None,
-                        'seg_color': None,
-                        'name': None,
+                        'id': None, 'type': None, 'seg_color': None, 'name': None,
                     })
             return new_obs
+        if self.seg_dropout and self.seg_dropout > 0.0:
+            # Perception ablation: 가시 객체를 확률 P로 무작위 누락 → seg_mask의 해당 픽셀도 0.
+            # 'strong→weak perception' graded 곡선용 (P=0 완벽 ~ P→1 실명).
+            new_obs = copy.deepcopy(obs)
+            for agent in obs:
+                seg = new_obs[agent]['seg_mask']
+                kept = []
+                for o in new_obs[agent]['visible_objects']:
+                    if o.get('id') is None:
+                        continue
+                    if self._seg_rng.random() < self.seg_dropout:
+                        # drop: 이 객체의 seg 픽셀을 0으로 (위치계산 get_pc가 못 잡게)
+                        col = o.get('seg_color')
+                        if col is not None and seg.ndim == 3:
+                            m = np.all(seg == np.array(col, dtype=seg.dtype), axis=-1)
+                            seg[m] = 0
+                    else:
+                        kept.append(o)
+                while len(kept) < 50:
+                    kept.append({'id': None, 'type': None, 'seg_color': None, 'name': None})
+                new_obs[agent]['visible_objects'] = kept
+            return new_obs
+        return obs
 
     def get_object_type(self, id):
         if id in self.target_object_ids:

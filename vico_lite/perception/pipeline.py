@@ -48,8 +48,16 @@ class PerceptionAlignmentPipeline:
             fused_components.append(kosmos_feat)
         fused_components.append(clip_text)
         fused = torch.cat(fused_components, dim=-1)
-        similarity = clip_image @ clip_text.unsqueeze(-1)
         object_infos = observation.get("object_infos") or [{"name": name} for name in observation.get("object_names", [])]
+        if getattr(self.cfg, "clip_object_ranking", False) and object_infos:
+            # 객체별 랭킹: 각 가시 객체 이름을 CLIP text로 인코딩해 이미지와의 유사도 (1,N) 계산
+            # → build_symbolic_descriptions의 topk가 N개 위에서 동작 → symbolic_top_k(K)가 실제 의미를 가짐.
+            names = [info.get("name", "") for info in object_infos]
+            obj_text = self.clip.encode_texts(names)          # (N, dim)
+            similarity = clip_image @ obj_text.t()            # (1, N) : 이미지 vs 각 객체명
+        else:
+            # 원본 동작(기본): 단일 image-text 스칼라 → topk가 항상 후보 1개.
+            similarity = clip_image @ clip_text.unsqueeze(-1)  # (1, 1)
         symbolic = build_symbolic_descriptions(similarity, object_infos, top_k=self.cfg.symbolic_top_k)
         return PerceptionOutput(vision_latent=clip_image.squeeze(0), text_latent=clip_text, fused_latent=fused, symbolic=symbolic)
 

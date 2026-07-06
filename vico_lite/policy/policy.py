@@ -3259,12 +3259,29 @@ class ViCoPolicy:
             # explore() 함수는 내부적으로 무한 루프에 빠질 수 있어 매우 위험함
             # 대신 현재 위치 주변의 간단한 위치를 생성하거나, team_symbolic에서 task_target을 찾음
             if not should_skip_explore:
-                # explore() 호출을 완전히 건너뛰고, 대신 간단한 fallback 로직 사용
-                if self.logger:
-                    self.logger.debug(
-                        "[Policy] _ensure_plan_target: skipping explore() call (too risky), using simple fallback instead"
-                    )
-                explore_x, explore_z = None, None
+                # FIX(2026-06-20): 실제 프론티어 탐색 explore()를 호출.
+                # 이전 코드는 여기서 explore_x/z를 무조건 None으로 두어 explore()가
+                # 한 번도 호출되지 않았고, 에이전트가 랜덤 워크만 하다 task object를
+                # 끝내 못 찾아 Transport Rate=0이 됐다. should_skip_explore=False이면
+                # known_map에 미탐색(0) 셀이 보장되므로 explore() 내부의
+                # random.randint(0, -1) ValueError는 발생하지 않는다.
+                # explore()의 예외/지연은 바깥 try/except + 이후 spiral-search
+                # fallback이 흡수하므로 안전하다.
+                try:
+                    explore_x, explore_z = self.agent_memory.explore(random_prob=0.1)
+                    if self.logger:
+                        self.logger.info(
+                            "[Policy] _ensure_plan_target: explore() returned (%s, %s)",
+                            explore_x,
+                            explore_z,
+                        )
+                except Exception as exc:
+                    if self.logger:
+                        self.logger.warning(
+                            "[Policy] _ensure_plan_target: explore() raised %s, using fallback",
+                            exc,
+                        )
+                    explore_x, explore_z = None, None
             
             # explore() 호출 후 위치 검증 (while 루프 밖에서)
             if explore_x is not None and explore_z is not None:
@@ -3888,7 +3905,30 @@ class ViCoPolicy:
                                         continue
                         except Exception:
                             pass
-            
+
+            # FIX(2026-06-20): 캐시에 위치가 없으면 현재 프레임 depth+seg로 직접 재계산.
+            # team_symbolic 경유 task target은 position이 None으로 초기화되고(위 ~1738행)
+            # "will be recalculated in _maybe_force_pick"라는 주석과 달리 여태 재계산이
+            # 없어서 보이는 음식조차 no_position으로 탈락 → 집기 0 → TR 0이었다.
+            # _prepare_perception_inputs와 동일하게 cal_object_position을 호출한다.
+            if position is None and info.get("seg_color") is not None \
+               and self.agent_memory is not None \
+               and hasattr(self.agent_memory, "cal_object_position") \
+               and getattr(self.agent_memory, "obs", None) is not None:
+                try:
+                    calc_pos, _, _calc_conf = self.agent_memory.cal_object_position(info)
+                    if calc_pos is not None:
+                        position = self._normalise_position(calc_pos)
+                        if position is not None:
+                            info["position"] = position
+                            if self.logger:
+                                self.logger.info(
+                                    "[Policy] _maybe_force_pick: recalculated position via cal_object_position id=%s name=%s pos=%s",
+                                    obj_id, info.get("name"), position,
+                                )
+                except Exception:
+                    pass
+
             # 방안 3: 최종 위치 검증
             # COELA는 map bounds 밖의 객체를 object_info에 저장하지 않지만,
             # cal_object_position이 잘못된 위치를 계산할 수 있으므로 모든 위치를 검증해야 함
@@ -4037,11 +4077,13 @@ class ViCoPolicy:
                     filtered_reasons["no_position"] = filtered_reasons.get("no_position", 0) + 1
                     continue
             else:
-                # position이 None이고 depth 기반 거리 추정도 없으면 필터링
-                # 단, needs_navigation이 이미 설정되어 있으면 계속 진행
-                if not info.get("needs_navigation", False):
-                    filtered_reasons["no_position"] = filtered_reasons.get("no_position", 0) + 1
-                    continue
+                # FIX(2026-06-21): position이 있으면 그대로 아래 distance/blocked/append
+                # 로직으로 진행한다. 기존 코드는 이 else(=position이 None이 아닌 경우)에서
+                # needs_navigation 플래그가 없으면 no_position으로 '잘못' 필터링했다.
+                # 그 결과 유효 위치를 가진 모든 task target(음식)이 후보에서 탈락 →
+                # _maybe_force_pick이 항상 None → 집기 0 → Transport Rate 0의 진짜 원인.
+                # (게이트 위 `if position is None:` 분기가 이미 position-없음 경우를 처리함.)
+                pass
             if info.get("distance") is None:
                 filtered_reasons["no_distance"] = filtered_reasons.get("no_distance", 0) + 1
                 continue
