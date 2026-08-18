@@ -1,5 +1,8 @@
 # TDW Multi-Agent Transport
 
+
+<img width="3168" height="1344" alt="figure1_5" src="https://github.com/user-attachments/assets/7dad0bb4-2525-4f8c-b8f2-e104e382bd81" />
+
 ## Codebase Layouts 
 
 ```
