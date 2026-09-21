@@ -78,7 +78,7 @@ class PlanExecutor:
             meta.update({"reason": "no_target_position"})
             return {"type": "ongoing"}, meta
         
-        # CRITICAL: Check distance FIRST before deciding navigation method
+        # The distance decides the navigation method, so measure it first.
         # This ensures we can detect when agent is close enough for put_in even during continuous navigation
         # Calculate actual distance from agent to target
         actual_distance = float("inf")
@@ -168,8 +168,7 @@ class PlanExecutor:
         if use_continuous_for_deliver and self.cfg.use_continuous_navigation:
             # Force continuous navigation for deliver to avoid guard blocking
             # Use arrived_at (2.5m) for deliver to ensure we get close enough for put_in
-            # 프레임 절약을 위해 arrived_at을 조금 크게 설정 (2.0m -> 2.5m)
-            arrived_at = 2.5  # Restored to original value; ablation succeeded at dist=2.46
+            arrived_at = 2.5  # put_in succeeds from 2.46 m, so stopping earlier wastes frames.
             action = {
                 "type": 9,  # Continuous movement
                 "target_position": target_pos,
@@ -193,7 +192,7 @@ class PlanExecutor:
             command, nav_meta = self._navigate_to(target_pos, agent_state, follow=True, is_goal_position=is_goal_position)
             meta.update(nav_meta)
             # Check if navigation failed but we're still close enough
-            # 장애물 감지 시에도 거리 확인하여 put_in 시도 (보완 로직)
+            # Even when navigation reports an obstacle, try put_in if close enough.
             if nav_meta.get("forced_failure") and actual_distance <= distance_threshold:
                 if self.logger:
                     self.logger.info(
@@ -204,10 +203,10 @@ class PlanExecutor:
                 command = {"type": 4}
                 meta.update({"result": "put_in_after_nav_failure", "distance": actual_distance, "distance_threshold": distance_threshold})
             elif nav_meta.get("forced_failure") and actual_distance != float("inf"):
-                # Navigation 실패했지만 거리가 임계값보다 약간 큰 경우 (3.0m 이내면 시도)
-                # deliver_fail_count를 고려하여 동적 임계값 적용
+                # Relax the threshold slightly on repeated delivery failures,
+                # since the remaining gap is usually a blocked last metre.
                 deliver_fail_count = agent_state.get("deliver_fail_count", {}).get(target_id, 0)
-                dynamic_threshold = min(distance_threshold + (deliver_fail_count * 0.1), 3.0)  # 최대 3.0m
+                dynamic_threshold = min(distance_threshold + (deliver_fail_count * 0.1), 3.0)
                 if actual_distance <= dynamic_threshold:
                     if self.logger:
                         self.logger.info(
@@ -230,9 +229,8 @@ class PlanExecutor:
             meta["reason"] = "no_agent_memory"
             return {"type": "ongoing"}, meta
         
-        # Clamp target to map boundaries (this already handles check_pos_in_room)
-        # BUT: Skip clamping for pick actions - they need the actual object position
-        original_target = target_pos
+        # Pick actions keep the raw object position; everything else is clamped
+        # into the floorplan first.
         if not skip_clamp:
             target_pos = self._clamp_target(target_pos)
         
@@ -270,7 +268,7 @@ class PlanExecutor:
                     if room_center is not None:
                         target_pos = (room_center[0], target_pos[1], room_center[2])
         
-        # ViCo-Lite 개선: Continuous movement for long distances
+        # Continuous movement for long distances, discrete steps for short ones.
         # Calculate distance to target
         distance_to_target = float("inf")
         if hasattr(self.agent_memory, "position") and self.agent_memory.position is not None:
@@ -295,9 +293,9 @@ class PlanExecutor:
                 )
             # Return continuous movement action (type 9)
             # Use smaller arrived_at for pick actions (0.3m) to get closer to objects
-            # 프레임 절약을 위해 arrived_at을 조금 크게 설정 (너무 가까이 가지 않도록)
+            # Stopping a little short of the target saves frames without losing reach.
             if arrived_at is None:
-                arrived_at = 1.0  # Default for general navigation (0.7m -> 1.0m로 증가하여 프레임 절약)
+                arrived_at = 1.0
             action = {
                 "type": 9,  # New action type for continuous movement
                 "target_position": target_pos,
@@ -311,7 +309,7 @@ class PlanExecutor:
             })
             return action, meta
         else:
-            # Use discrete step-by-step movement (COELA 방식)
+            # Discrete step-by-step movement, as in the CoELA baseline.
             action, path_len = self.agent_memory.move_to_pos(target_pos, follow=follow)
             meta.update({
                 "navigation": "move_to_pos",
@@ -319,9 +317,9 @@ class PlanExecutor:
                 "method": "discrete",
             })
             guard_threshold = self._guard_threshold()
-            # 개선: path_len이 너무 길면 (100 이상) 무조건 skip (CoELA의 EXPLORE_MAX_COST=10000과 유사한 개념)
-            # 단, deliver (goal_position_id)의 경우 반드시 도달해야 하므로 제한을 완화 (200까지 허용)
-            max_path_length = 200 if is_goal_position else 100  # deliver의 경우 200까지 허용
+            # Skip implausibly long paths, but allow twice the budget for a
+            # delivery, which has to reach the goal to score at all.
+            max_path_length = 200 if is_goal_position else 100
             if path_len is not None and path_len > max_path_length:
                 key = tuple(int(x * 10) for x in target_pos[:2])
                 self._guard_skip[key] = {"frames": self.guard_skip_decay, "target": target_pos}
@@ -364,26 +362,26 @@ class PlanExecutor:
         is_force_pick = plan.meta.get("override") == "near_grabbable" or plan.meta.get("reason") == "policy_override_grabbable"
         force_pick_distance = plan.meta.get("distance")
         
-        # 핵심 수정: target_pos가 (0,0,0)이어도 object_id가 있으면 reach_for 사용
-        # LLM이 잘못된 위치를 제안해도 object_id만으로 pick 시도 가능
+        # A degenerate (0,0,0) target is still actionable: reach_for only needs
+        # the object id, so fall back to it rather than rejecting the plan.
         target_id = plan.target_id
         is_task_target = plan.meta.get("is_task_target", False)
         has_invalid_position = target_pos is not None and (target_pos == (0.0, 0.0, 0.0) or (abs(target_pos[0]) < 0.01 and abs(target_pos[2]) < 0.01))
         
         if has_invalid_position:
             if target_id is not None and (is_task_target or is_force_pick):
-                # object_id가 있고 task target이면 reach_for 사용 (object_id만으로 pick 시도)
+                # Known task target: pick by id alone.
                 if self.logger:
                     self.logger.info(
                         "[Executor] pick: invalid target_pos (0,0,0) but object_id=%s exists, using reach_for with object_id only",
                         target_id,
                     )
-                # target_pos를 None으로 설정하여 object_id만으로 pick 시도
+                # Drop the bogus position so the id-only path is taken.
                 target_pos = None
                 meta["navigation"] = "reach_for_with_object_id"
                 meta["note"] = "invalid_position_using_object_id_reach_for"
             else:
-                # object_id가 없거나 task target이 아니면 reject
+                # Without an id and without a task target there is nothing to act on.
                 if self.logger:
                     self.logger.warning(
                         "[Executor] rejecting pick with invalid target_pos (0,0,0) and no valid object_id: target_id=%s",
@@ -392,8 +390,8 @@ class PlanExecutor:
                 meta.update({"reason": "invalid_target_position"})
                 return {"type": "ongoing"}, meta
         
-        # 핵심 수정: object_id 체크 전에 navigation 먼저 시작
-        # 10m 제한으로 인해 object_info에 없어도 navigation은 시도해야 함
+        # Start navigating before checking the id: the depth cutoff keeps distant
+        # objects out of object_info, but they are still worth approaching.
         navigation_started = False
         navigation_command = None
         
@@ -432,13 +430,13 @@ class PlanExecutor:
                         )
                     meta["guard_ignored"] = True
         else:
-            # 방법 1: Depth 기반 거리 추정 활용 강화 - target_pos is None이지만 distance가 있으면 navigation 시도
-            # 10m 제한으로 인해 위치 계산이 실패했지만 depth로 거리는 알 수 있는 경우
+            # Position estimation failed but depth still gives a range, which is
+            # enough to start closing the distance.
             is_task_target = plan.meta.get("is_task_target", False)
             retry_navigation = plan.meta.get("reason") == "retry_navigation_after_failure"
             use_reach_for_flag = plan.meta.get("use_reach_for", False)
             
-            # 방법 1: use_reach_for 플래그가 있으면 바로 reach_for 사용
+            # An explicit reach_for request skips navigation entirely.
             if use_reach_for_flag:
                 if self.logger:
                     self.logger.info(
@@ -539,19 +537,15 @@ class PlanExecutor:
             meta.update({"reason": "invalid_target_id_type"})
             return {"type": "ongoing"}, meta
         
-        # 핵심 수정: object_id 체크를 navigation 이후로 이동
-        # Navigation이 이미 시작되었으면 navigation을 계속 진행하고, pick은 나중에 시도
-        # 10m 제한으로 인해 object_info에 없어도 navigation은 허용해야 함
-        object_in_memory = True
+        # Once navigation is under way, let it finish and retry the pick later
+        # rather than aborting because the object is not in object_info yet.
         if self.agent_memory is not None and hasattr(self.agent_memory, "object_info"):
             try:
                 if target_id_int not in self.agent_memory.object_info:
-                    object_in_memory = False
                     is_task_target = plan.meta.get("is_task_target", False)
                     use_reach_for_flag = plan.meta.get("use_reach_for", False)
-                    # 핵심 수정: target_pos가 None이고 reach_for를 사용할 경우, object_id 체크를 건너뜀
-                    # reach_for (type 3)는 object_id만으로도 동작하므로 object_info에 없어도 사용 가능
-                    # use_reach_for 플래그가 설정되어 있거나, meta note가 reach_for 관련이면 허용
+                    # reach_for works from the object id alone, so an object missing
+                    # from memory is not a reason to reject it.
                     if use_reach_for_flag or (target_pos is None and meta.get("note") in ("no_position_using_object_id_reach_for", "use_reach_for_flag_set")):
                         if self.logger:
                             self.logger.info(
@@ -560,9 +554,7 @@ class PlanExecutor:
                                 use_reach_for_flag,
                                 meta.get("note"),
                             )
-                        # object_in_memory를 True로 설정하여 이후 로직에서 reach_for를 사용할 수 있도록 함
-                        object_in_memory = True
-                    # Navigation이 이미 시작되었으면 navigation을 계속 진행
+                    # Navigation already in flight: keep going.
                     elif navigation_started and navigation_command is not None:
                         if self.logger:
                             self.logger.info(
@@ -572,25 +564,25 @@ class PlanExecutor:
                             )
                         meta.update({"reason": "object_not_in_memory_but_navigating", "will_retry_pick_after_nav": True})
                         return navigation_command, meta
-                    # Task target이고 target_pos가 있으면 navigation 허용
+                    # A task target with a position is always worth approaching.
                     elif is_task_target and target_pos is not None:
                         if self.logger:
                             self.logger.info(
                                 "[Executor] object_id=%s not in agent_memory.object_info but is task target, allowing navigation",
                                 target_id_int,
                             )
-                        # Navigation은 이미 시작되었거나 시작할 예정이므로 계속 진행
+                        # Navigation is in flight or about to start.
                         if navigation_command is not None:
                             meta.update({"reason": "object_not_in_memory_but_navigating", "will_retry_pick_after_nav": True})
                             return navigation_command, meta
-                        # Navigation이 아직 시작되지 않았으면 시작
+                        # Nothing in flight yet: start navigating.
                         else:
                             navigation_command, nav_meta = self._navigate_to(target_pos, agent_state, follow=True, skip_clamp=True)
                             meta.update(nav_meta)
                             meta.update({"reason": "object_not_in_memory_but_navigating", "will_retry_pick_after_nav": True})
                             return navigation_command, meta
                     else:
-                        # Navigation도 없고 task target도 아니면 스킵
+                        # Neither navigating nor a task target: skip it.
                         if self.logger:
                             self.logger.warning(
                                 "[Executor] object_id=%s not in agent_memory.object_info, skipping pick (may cause KeyError)",
@@ -624,12 +616,10 @@ class PlanExecutor:
         if actual_distance == float("inf") and plan.meta.get("distance") is not None:
             actual_distance = float(plan.meta.get("distance"))
         
-        # 방안 4: Pick 거리 임계값 조정 - 2.0m에서 2.5m로 완화
-        reach_threshold = 2.5  # 2.0에서 2.5로 증가
+        reach_threshold = 2.5
         
-        # 핵심 수정: target_pos가 None이고 object_id만 있는 경우, reach_for (type 3)를 바로 사용
-        # reach_for는 자동으로 navigation을 수행하므로 거리 체크를 건너뜀
-        # use_reach_for 플래그가 설정되어 있거나, meta note가 reach_for 관련이면 허용
+        # reach_for navigates on its own, so with only an object id the distance
+        # check is skipped and the command is issued directly.
         use_reach_for_flag = plan.meta.get("use_reach_for", False)
         reach_for_notes = ("no_position_using_object_id_reach_for", "invalid_position_using_object_id_reach_for", "use_reach_for_flag_set")
         if use_reach_for_flag or (target_pos is None and meta.get("note") in reach_for_notes):
@@ -704,222 +694,139 @@ class PlanExecutor:
     def guard_summary(self):
         return {key: value["frames"] for key, value in self._guard_skip.items()}
 
+    # -- target validation ---------------------------------------------------
+    def _agent_position(self):
+        """Current agent position as ((x, z), (x, y, z)), or (None, None)."""
+        position = getattr(self.agent_memory, "position", None)
+        if position is None:
+            return None, None
+        try:
+            if len(position) < 3:
+                return None, None
+            return (float(position[0]), float(position[2])), position
+        except (TypeError, ValueError):
+            return None, None
+
+    def _scene_bounds(self):
+        bounds = getattr(self.agent_memory, "_scene_bounds", None)
+        if not bounds:
+            return None
+        values = [bounds.get(key) for key in ("x_min", "x_max", "z_min", "z_max")]
+        return None if any(value is None for value in values) else values
+
+    def _clamp_to_bounds(self, coord, margin=0.0):
+        bounds = self._scene_bounds()
+        if bounds is None:
+            return coord
+        x_min, x_max, z_min, z_max = bounds
+        x = min(max(coord[0], x_min + margin), x_max - margin)
+        z = min(max(coord[1], z_min + margin), z_max - margin)
+        return (x, z)
+
+    def _in_room(self, coord) -> bool:
+        """Whether the environment considers this (x, z) inside the floorplan.
+
+        A missing API means we cannot tell, and the position is accepted.
+        """
+        if not self.env_api or "check_pos_in_room" not in self.env_api:
+            return True
+        try:
+            return bool(self.env_api["check_pos_in_room"]((coord[0], coord[1])))
+        except Exception:
+            return False
+
+    def _scene_centre(self):
+        bounds = self._scene_bounds()
+        if bounds is None:
+            return None
+        x_min, x_max, z_min, z_max = bounds
+        centre = ((x_min + x_max) / 2.0, (z_min + z_max) / 2.0)
+        return centre if self._in_room(centre) else None
+
+    def _room_centre(self, agent_xyz, agent_xz):
+        """Centre of the room the agent is standing in, if it can be resolved."""
+        if agent_xz is None:
+            return None
+        if not hasattr(self.agent_memory, "belongs_to_which_room"):
+            return None
+        if not hasattr(self.agent_memory, "center_of_room"):
+            return None
+        try:
+            reference = agent_xyz if agent_xyz is not None else (agent_xz[0], 0, agent_xz[1])
+            room = self.agent_memory.belongs_to_which_room(reference)
+            if room is None:
+                return None
+            centre = self.agent_memory.center_of_room(room)
+        except Exception:
+            return None
+        if centre is None:
+            return None
+        candidate = (centre[0], centre[2])
+        return candidate if self._in_room(candidate) else None
+
+    def _search_near(self, agent_xz, max_radius=5.0, step=1.0):
+        """First in-bounds, in-room position found on rings around the agent."""
+        if agent_xz is None:
+            return None
+        bounds = self._scene_bounds()
+        radius = step
+        while radius <= max_radius:
+            for angle in range(0, 360, 45):
+                radians = math.radians(angle)
+                candidate = (
+                    agent_xz[0] + radius * math.cos(radians),
+                    agent_xz[1] + radius * math.sin(radians),
+                )
+                if bounds is not None:
+                    x_min, x_max, z_min, z_max = bounds
+                    if not (x_min <= candidate[0] <= x_max and z_min <= candidate[1] <= z_max):
+                        continue
+                if self._in_room(candidate):
+                    return candidate
+            radius += step
+        return None
+
     def _clamp_target(self, target_pos):
+        """Move a target inside the scene bounds and into a reachable room.
+
+        Anything outside the floorplan is replaced by the nearest sensible
+        alternative: the agent itself, the scene centre, the centre of the room
+        the agent is in, or a point found by searching rings around the agent.
+        """
         if self.agent_memory is None:
             return target_pos
         x, y, z = target_pos
-        
-        # Get agent's current position for fallback
-        agent_pos = None
-        agent_pos_full = None
-        if hasattr(self.agent_memory, "position") and self.agent_memory.position is not None:
-            try:
-                agent_pos_full = self.agent_memory.position
-                if isinstance(agent_pos_full, (list, tuple, np.ndarray)) and len(agent_pos_full) >= 3:
-                    agent_pos = (float(agent_pos_full[0]), float(agent_pos_full[2]))
-                else:
-                    agent_pos_full = None
-            except Exception:
-                agent_pos_full = None
-        
-        # First, try to clamp using scene_bounds with safety margin
-        clamped_x, clamped_z = x, z
-        if hasattr(self.agent_memory, "_scene_bounds"):
-            bounds = getattr(self.agent_memory, "_scene_bounds", None)
-            if bounds:
-                x_min = bounds.get("x_min")
-                x_max = bounds.get("x_max")
-                z_min = bounds.get("z_min")
-                z_max = bounds.get("z_max")
-                # Add safety margin (0.5m) to prevent going outside
-                margin = 0.5
-                if x_min is not None and x_max is not None:
-                    clamped_x = min(max(x, x_min + margin), x_max - margin)
-                if z_min is not None and z_max is not None:
-                    clamped_z = min(max(z, z_min + margin), z_max - margin)
-        
-        # Then, check if clamped position is in room
-        if self.env_api and "check_pos_in_room" in self.env_api:
-            if not self.env_api["check_pos_in_room"]((clamped_x, clamped_z)):
-                # If not in room, use agent's current position
-                if agent_pos is not None:
-                    clamped_x, clamped_z = agent_pos
-                elif agent_pos_full is not None:
-                    try:
-                        if isinstance(agent_pos_full, (list, tuple, np.ndarray)) and len(agent_pos_full) >= 3:
-                            clamped_x = float(agent_pos_full[0])
-                            clamped_z = float(agent_pos_full[2])
-                        else:
-                            clamped_x = 0.0
-                            clamped_z = 0.0
-                    except Exception:
-                        clamped_x = 0.0
-                        clamped_z = 0.0
-                else:
-                    clamped_x = 0.0
-                    clamped_z = 0.0
-                # Verify the fallback position is valid
-                if self.env_api and "check_pos_in_room" in self.env_api:
-                    if not self.env_api["check_pos_in_room"]((clamped_x, clamped_z)):
-                        # Try to find a valid position: first try scene_bounds center, then agent position
-                        valid_pos = None
-                        # Try scene_bounds center
-                        if hasattr(self.agent_memory, "_scene_bounds"):
-                            bounds = getattr(self.agent_memory, "_scene_bounds", None)
-                            if bounds:
-                                x_min = bounds.get("x_min")
-                                x_max = bounds.get("x_max")
-                                z_min = bounds.get("z_min")
-                                z_max = bounds.get("z_max")
-                                if x_min is not None and x_max is not None and z_min is not None and z_max is not None:
-                                    center_x = (x_min + x_max) / 2.0
-                                    center_z = (z_min + z_max) / 2.0
-                                    if self.env_api["check_pos_in_room"]((center_x, center_z)):
-                                        valid_pos = (center_x, center_z)
-                        # If scene_bounds center is not valid, try agent's current room center
-                        if valid_pos is None and agent_pos is not None:
-                            if hasattr(self.agent_memory, "belongs_to_which_room") and hasattr(self.agent_memory, "center_of_room"):
-                                try:
-                                    agent_room = self.agent_memory.belongs_to_which_room(agent_pos_full if agent_pos_full is not None else (agent_pos[0], 0, agent_pos[1]))
-                                    if agent_room is not None:
-                                        room_center = self.agent_memory.center_of_room(agent_room)
-                                        if room_center is not None and self.env_api["check_pos_in_room"]((room_center[0], room_center[2])):
-                                            valid_pos = (room_center[0], room_center[2])
-                                except Exception:
-                                    pass
-                        # If still no valid position, try to find a valid position near agent's current position
-                        if valid_pos is None and agent_pos is not None:
-                            # Try positions around agent's current position (spiral search)
-                            search_radius = 1.0
-                            max_radius = 5.0
-                            found_valid = False
-                            while search_radius <= max_radius and not found_valid:
-                                # Try 8 directions around agent position
-                                for angle in [0, 45, 90, 135, 180, 225, 270, 315]:
-                                    rad = math.radians(angle)
-                                    test_x = agent_pos[0] + search_radius * math.cos(rad)
-                                    test_z = agent_pos[1] + search_radius * math.sin(rad)
-                                    # Check map bounds first
-                                    if hasattr(self.agent_memory, "_scene_bounds"):
-                                        bounds = getattr(self.agent_memory, "_scene_bounds", None)
-                                        if bounds:
-                                            x_min = bounds.get("x_min")
-                                            x_max = bounds.get("x_max")
-                                            z_min = bounds.get("z_min")
-                                            z_max = bounds.get("z_max")
-                                            if (x_min is not None and x_max is not None and (test_x < x_min or test_x > x_max)) or \
-                                               (z_min is not None and z_max is not None and (test_z < z_min or test_z > z_max)):
-                                                continue
-                                    # Check if in room
-                                    if self.env_api and "check_pos_in_room" in self.env_api:
-                                        try:
-                                            if self.env_api["check_pos_in_room"]((test_x, test_z)):
-                                                valid_pos = (test_x, test_z)
-                                                found_valid = True
-                                                break
-                                        except Exception:
-                                            pass
-                                if found_valid:
-                                    break
-                                search_radius += 1.0
-                        
-                        if valid_pos is not None:
-                            clamped_x, clamped_z = valid_pos
-                            if self.logger:
-                                self.logger.debug(
-                                    "[Executor] target %s outside room, using valid fallback position (%s, %s)",
-                                    target_pos,
-                                    clamped_x,
-                                    clamped_z,
-                                )
-                        else:
-                            # Last resort: use agent's current position if available, otherwise (0, 0)
-                            if agent_pos is not None:
-                                clamped_x, clamped_z = agent_pos
-                                if self.logger:
-                                    self.logger.warning(
-                                        "[Executor] target %s outside room, using agent's current position as fallback (%s, %s)",
-                                        target_pos,
-                                        clamped_x,
-                                        clamped_z,
-                                    )
-                            else:
-                                clamped_x = 0.0
-                                clamped_z = 0.0
-                                if self.logger:
-                                    self.logger.warning(
-                                        "[Executor] target %s outside room, resetting to (0, 0) (no agent position available)",
-                                        target_pos,
-                                    )
-        
-        # Final safety check: ensure clamped position is within scene_bounds
-        if hasattr(self.agent_memory, "_scene_bounds"):
-            bounds = getattr(self.agent_memory, "_scene_bounds", None)
-            if bounds:
-                x_min = bounds.get("x_min")
-                x_max = bounds.get("x_max")
-                z_min = bounds.get("z_min")
-                z_max = bounds.get("z_max")
-                if x_min is not None and x_max is not None:
-                    clamped_x = min(max(clamped_x, x_min), x_max)
-                if z_min is not None and z_max is not None:
-                    clamped_z = min(max(clamped_z, z_min), z_max)
-        
-        # Final check: if clamped position is (0,0) or still outside room, try to find a valid position
-        if self.env_api and "check_pos_in_room" in self.env_api:
-            if not self.env_api["check_pos_in_room"]((clamped_x, clamped_z)):
-                # Try to find a valid position: use scene_bounds center or agent's current room
-                final_valid_pos = None
-                # Try scene_bounds center first
-                if hasattr(self.agent_memory, "_scene_bounds"):
-                    bounds = getattr(self.agent_memory, "_scene_bounds", None)
-                    if bounds:
-                        x_min = bounds.get("x_min")
-                        x_max = bounds.get("x_max")
-                        z_min = bounds.get("z_min")
-                        z_max = bounds.get("z_max")
-                        if x_min is not None and x_max is not None and z_min is not None and z_max is not None:
-                            center_x = (x_min + x_max) / 2.0
-                            center_z = (z_min + z_max) / 2.0
-                            if self.env_api["check_pos_in_room"]((center_x, center_z)):
-                                final_valid_pos = (center_x, center_z)
-                # If scene_bounds center is not valid, try agent's current room center
-                if final_valid_pos is None and agent_pos is not None:
-                    if hasattr(self.agent_memory, "belongs_to_which_room") and hasattr(self.agent_memory, "center_of_room"):
-                        try:
-                            agent_room = self.agent_memory.belongs_to_which_room(agent_pos_full if agent_pos_full is not None else (agent_pos[0], 0, agent_pos[1]))
-                            if agent_room is not None:
-                                room_center = self.agent_memory.center_of_room(agent_room)
-                                if room_center is not None and self.env_api["check_pos_in_room"]((room_center[0], room_center[2])):
-                                    final_valid_pos = (room_center[0], room_center[2])
-                        except Exception:
-                            pass
-                # If we found a valid position, use it
-                if final_valid_pos is not None:
-                    clamped_x, clamped_z = final_valid_pos
-                    if self.logger:
-                        self.logger.debug(
-                            "[Executor] final clamp: (%s, %s) outside room, using valid position (%s, %s)",
-                            clamped_x,
-                            clamped_z,
-                            final_valid_pos[0],
-                            final_valid_pos[1],
-                        )
-                elif (clamped_x == 0.0 and clamped_z == 0.0):
-                    # (0,0) is invalid, but we have no better option - log warning
-                    if self.logger:
-                        self.logger.warning(
-                            "[Executor] clamped position (0, 0) is outside room and no valid fallback found for target %s",
-                            target_pos,
-                        )
-        
-        if clamped_x != x or clamped_z != z:
-            if self.logger and getattr(self.logger, "debug", None):
-                self.logger.debug(
-                    "[Executor] clamp target from %s to (%s, %s, %s)",
-                    target_pos,
-                    clamped_x,
-                    y,
-                    clamped_z,
+        agent_xz, agent_xyz = self._agent_position()
+
+        clamped = self._clamp_to_bounds((x, z), margin=0.5)
+        if not self._in_room(clamped):
+            clamped = agent_xz or (0.0, 0.0)
+            if not self._in_room(clamped):
+                fallback = (
+                    self._scene_centre()
+                    or self._room_centre(agent_xyz, agent_xz)
+                    or self._search_near(agent_xz)
                 )
-        return (clamped_x, y, clamped_z)
+                if fallback is not None:
+                    clamped = fallback
+                elif self.logger:
+                    self.logger.warning(
+                        "[Executor] target %s outside the floorplan and no valid fallback found",
+                        target_pos,
+                    )
+
+        clamped = self._clamp_to_bounds(clamped)
+        if not self._in_room(clamped):
+            fallback = self._scene_centre() or self._room_centre(agent_xyz, agent_xz)
+            if fallback is not None:
+                clamped = fallback
+            elif self.logger:
+                self.logger.warning(
+                    "[Executor] clamped position %s is outside the floorplan (target %s)",
+                    clamped,
+                    target_pos,
+                )
+
+        if (clamped[0], clamped[1]) != (x, z) and self.logger:
+            self.logger.debug("[Executor] clamp target %s -> %s", target_pos, clamped)
+        return (clamped[0], y, clamped[1])

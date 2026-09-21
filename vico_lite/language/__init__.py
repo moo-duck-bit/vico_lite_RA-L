@@ -1,11 +1,9 @@
-from .encoder import ClipTextEncoder
-from .guidance import GuidanceController, ReasonedPlan, GuidanceResult
+from .guidance import GuidanceController, GuidanceResult, ReasonedPlan
 from .reasoner import PolicyReasoner
 
 __all__ = [
-    "ClipTextEncoder",
     "GuidanceController",
+    "GuidanceResult",
     "PolicyReasoner",
     "ReasonedPlan",
-    "GuidanceResult",
 ]

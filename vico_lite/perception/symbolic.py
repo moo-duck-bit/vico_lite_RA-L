@@ -1,31 +1,36 @@
 from __future__ import annotations
 
-from typing import Dict, List, Sequence
+from typing import Any, Dict, List, Sequence
 
 import torch
 
 
 def build_symbolic_descriptions(
-    similarity: torch.Tensor,
-    object_infos: Sequence[Dict[str, object]],
+    scores: torch.Tensor,
+    object_infos: Sequence[Dict[str, Any]],
     top_k: int = 5,
-) -> List[Dict[str, object]]:
-    """Return a list of symbolic descriptions given similarity scores and object metadata."""
-    if similarity.ndim == 1:
-        similarity = similarity.unsqueeze(0)
-    results: List[Dict[str, object]] = []
+) -> List[Dict[str, Any]]:
+    """Retain the top-K scored objects as symbolic entries.
+
+    Each entry keeps the object metadata produced by the policy (label,
+    estimated 3D position, distance, task flags) and adds the visual-language
+    relevance score used to rank it.
+    """
     infos = list(object_infos)
-    for scores in similarity:
-        values, indices = torch.topk(scores, k=min(top_k, scores.shape[-1]))
-        entry = []
-        for idx, val in zip(indices.tolist(), values.tolist()):
-            base: Dict[str, object]
-            if idx < len(infos):
-                base = dict(infos[idx])
-            else:
-                base = {}
-            base.setdefault("name", base.get("name", f"obj_{idx}"))
-            base["score"] = float(val)
-            entry.append(base)
-        results.append({"candidates": entry})
-    return results
+    if not infos or scores.numel() == 0:
+        return [{"candidates": []}]
+
+    flat = scores.flatten()[: len(infos)]
+    k = max(1, min(top_k, flat.numel()))
+    values, indices = torch.topk(flat, k=k)
+
+    candidates: List[Dict[str, Any]] = []
+    for index, value in zip(indices.tolist(), values.tolist()):
+        entry = dict(infos[index])
+        entry.setdefault("name", f"obj_{index}")
+        entry["score"] = float(value)
+        candidates.append(entry)
+    return [{"candidates": candidates}]
+
+
+__all__ = ["build_symbolic_descriptions"]

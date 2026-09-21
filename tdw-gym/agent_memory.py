@@ -269,11 +269,9 @@ class AgentMemory():
         xx = (xx - cx) / fx * depth
         yy = (yy - cy) / fy * depth
 
-        # FIX(2026-06-20): depth 한도를 10m→25m로 확대.
-        # smoke6 진단: 픽셀 수십~수백 개(26/44/358)로 또렷이 보이는 객체도
-        # matched_depth가 12~19m라 10m 컷오프에 전부 걸려 valid_count=0 → 위치
-        # 계산 실패 → no_position → 집기 0 → TR 0. 또렷이 보이는 객체를 멀리서도
-        # localize해 접근할 수 있도록 한도를 넓힌다. (정확도 저하는 접근하며 자연히 보정)
+        # Objects clearly visible across a room sit at 12-20 m, so a 10 m cutoff
+        # rejects every one of their pixels and they never get a position. The
+        # extra range is noisier, but the estimate refines as the agent closes in.
         max_depth = 25.0
         index = np.where((depth > 0) & (depth < max_depth))
         valid_count = len(index[0])
@@ -370,16 +368,15 @@ class AgentMemory():
             obj_id = o_dict.get('id')
             current_frame = self.obs.get('current_frames', 0) if hasattr(self, 'obs') and self.obs is not None else 0
             
-            # 방법 2: 포인트 수 요구사항 완화 - 3-4개 포인트도 허용 (낮은 신뢰도)
-            # 방법 3: 이전 위치 정보 활용 - agent_memory에 이전 위치 저장 및 활용
-            # 방법 4: Multi-frame 위치 추정 - 여러 프레임의 위치 정보 누적
+            # A sparse point cloud still yields a usable position: accept it at a
+            # reduced confidence, fall back to the cached estimate, and average
+            # across recent frames.
             
-            # 포인트 수에 따라 신뢰도 조정
+            # Confidence follows the number of matched points.
             confidence = 1.0
             if pc is None or pc.shape[1] < 1:
-                # FIX(2026-06-20): 점 0개만 실패 처리(이전엔 <3 실패).
-                # 작은 task object(orange/bread)는 멀리서 1-2픽셀만 잡혀 전부
-                # 실패→no_position→집기 0이었다. 1-2점은 아래서 저신뢰로 허용.
+                # Small targets such as an orange cover one or two pixels from
+                # across a room; only an empty cloud counts as a failure.
                 if hasattr(self, 'logger') and self.logger:
                     if not hasattr(self, '_logged_failed_objects'):
                         self._logged_failed_objects = set()
@@ -392,12 +389,12 @@ class AgentMemory():
                         )
                         self._logged_failed_objects.add(obj_id)
                 
-                # 방법 3: 이전 위치 정보 활용 (fallback)
+                # Fall back to the last position we had for this object.
                 if obj_id is not None and hasattr(self, 'object_info') and obj_id in self.object_info:
                     cached_info = self.object_info[obj_id]
                     last_known_position = cached_info.get('last_known_position')
                     last_seen_frame = cached_info.get('last_seen_frame', 0)
-                    # TTL 체크: 100프레임 이내의 위치만 사용
+                    # Only trust a cached position for 100 frames.
                     if last_known_position is not None and current_frame - last_seen_frame < 100:
                         if hasattr(self, 'logger') and self.logger:
                             self.logger.debug(
@@ -407,17 +404,16 @@ class AgentMemory():
                                 current_frame,
                                 current_frame - last_seen_frame,
                             )
-                        # 낮은 신뢰도로 반환
+                        # Cached, so return it at reduced confidence.
                         return last_known_position, None, 0.5
                 
                 return None, None, 0.0
             elif pc.shape[1] < 3:
-                # FIX(2026-06-20): 1-2개 점은 매우 낮은 신뢰도로 허용.
-                # 거친 위치라도 줘서 멀리 있는 작은 음식에 접근(navigation)을
-                # 시작할 수 있게 한다. 접근하며 픽셀이 늘면 위치가 자연히 보정됨.
+                # One or two points give a coarse position, which is enough to
+                # start navigating; it sharpens as more pixels come into view.
                 confidence = 0.3
             elif pc.shape[1] < 5:
-                # 3-4개 포인트: 낮은 신뢰도로 허용
+                # Three or four points: usable, but not reliable.
                 confidence = 0.5
                 if hasattr(self, 'logger') and self.logger:
                     if not hasattr(self, '_logged_low_confidence_objects'):
@@ -431,29 +427,28 @@ class AgentMemory():
                         )
                         self._logged_low_confidence_objects.add(obj_id)
             
-            # 방법 4: Multi-frame 위치 추정
-            # 여러 프레임의 위치 정보를 누적하여 추정
+            # Blend the current estimate with the last few frames.
             position_history = []
             if obj_id is not None and hasattr(self, 'object_info') and obj_id in self.object_info:
                 cached_info = self.object_info[obj_id]
-                # 최근 5프레임의 위치 정보 수집
+                # Keep the last five observations.
                 for frame_offset in range(1, 6):
                     frame_key = f'position_frame_{current_frame - frame_offset}'
                     if frame_key in cached_info:
                         position_history.append(cached_info[frame_key])
             
-            # 현재 프레임의 위치 계산
+            # Position from the current frame.
             position = pc.mean(1)
             pos_3d = position[:3]
             
-            # 이전 위치 정보와 결합 (Multi-frame 추정)
+            # Combine with the history.
             if len(position_history) >= 2:
-                # 이전 위치들의 중앙값과 현재 위치의 가중 평균
+                # Weighted average of the current estimate and the past median.
                 position_history_array = np.array(position_history)
                 median_prev_pos = np.median(position_history_array, axis=0)
-                # 현재 위치에 더 높은 가중치 (0.7), 이전 위치에 낮은 가중치 (0.3)
+                # The current frame dominates; the history only damps jitter.
                 pos_3d = 0.7 * pos_3d + 0.3 * median_prev_pos[:3]
-                confidence = min(confidence + 0.2, 1.0)  # 신뢰도 증가
+                confidence = min(confidence + 0.2, 1.0)
                 if hasattr(self, 'logger') and self.logger:
                     self.logger.debug(
                         "[AgentMemory] cal_object_position: multi-frame estimation for id=%s (history_size=%d, confidence=%.2f)",
@@ -462,7 +457,7 @@ class AgentMemory():
                         confidence,
                     )
             
-            # 방법 3: 계산된 위치를 object_info에 저장 (다음 프레임을 위해)
+            # Cache the result for the next frame.
             if obj_id is not None:
                 if not hasattr(self, 'object_info'):
                     self.object_info = {}
@@ -470,10 +465,10 @@ class AgentMemory():
                     self.object_info[obj_id] = {}
                 self.object_info[obj_id]['last_known_position'] = pos_3d.copy() if isinstance(pos_3d, np.ndarray) else pos_3d
                 self.object_info[obj_id]['last_seen_frame'] = current_frame
-                # 최근 5프레임의 위치 저장 (Multi-frame 추정을 위해)
+                # Retain the five most recent positions.
                 frame_key = f'position_frame_{current_frame}'
                 self.object_info[obj_id][frame_key] = pos_3d.copy() if isinstance(pos_3d, np.ndarray) else pos_3d
-                # 오래된 프레임 정보 제거 (메모리 절약)
+                # Drop anything older.
                 for old_frame in range(current_frame - 10, current_frame - 5):
                     old_frame_key = f'position_frame_{old_frame}'
                     self.object_info[obj_id].pop(old_frame_key, None)
@@ -955,7 +950,6 @@ class AgentMemory():
             # Wait for the obstacle to move
             action = {"type": 1}
 
-        # print("now save map: ", os.path.join(self.output_dir, 'Images', str(self.agent_id), f'{self.obs["current_frames"]:04}'))
         return action, len(path) 
     
     def draw_map(self, previous_name, save = True):
@@ -1093,12 +1087,9 @@ class AgentMemory():
             idx = min(int(len(points) * 3 / 4), len(points) - 1)
             curr_x, curr_z = points[idx][1], points[idx][2]
 
-        # FIX(2026-06-20): 무한 루프 방지 상한. 도달 가능한 미탐색 프론티어가
-        # 없으면(모든 랜덤 셀이 obstacle_distance>EXPLORE_MAX_COST 거나 너무 가까움)
-        # 이 루프가 find_shortest_path(A*)를 영원히 돌려 episode가 hang된다
-        # (smoke5: frame 191에서 137% CPU 스핀으로 40분+ 고착). 상한 도달 시
-        # RuntimeError를 던져 호출측(policy._ensure_plan_target)의 try/except가
-        # 받아 spiral-search fallback으로 넘기도록 한다.
+        # When no unexplored cell is reachable, this loop would call A* forever
+        # and hang the episode. Give up after a bounded number of draws and let
+        # the caller fall back to its spiral search.
         MAX_RANDOM_TRIES = 200
         random_tries = 0
         while curr_x is None:
@@ -1118,7 +1109,6 @@ class AgentMemory():
                 continue
             distance = len(path) * 2 + obstacle_distance
             l2_distance = self.l2_distance(self.position, (x, z))
-            # print(l2_distance)  # Debug print removed
             if distance < curr_min_distance and l2_distance > SURROUNDING_DISTANCE:
                 curr_min_distance = distance
                 curr_x, curr_z = x, z

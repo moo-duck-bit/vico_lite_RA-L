@@ -1,25 +1,24 @@
-import re
 from pathlib import Path
-from setuptools import setup, find_packages
 
-readme = Path('README.md').read_text(encoding='utf-8')
-# Replace relative markdown links with absolute https links.
-readme = re.sub(r'\[(.*?)\]\(doc/(.*?)\)', r'[\1][https://github.com/alters-mit/transport_challenge_multi_agent/blob/main/doc/\2]', readme)
+from setuptools import find_packages, setup
 
-with open('requirements.txt') as f:
-    required = f.read().splitlines()
+readme = Path("README.md").read_text(encoding="utf-8")
+requirements = Path("requirements.txt").read_text(encoding="utf-8").splitlines()
 
 setup(
-    name='transport_challenge_multi_agent',
-    version="0.2.2",
-    description='High-level multi-agent Transport Challenge API for TDW.',
+    name="vico-lite",
+    version="0.3.0",
+    description=(
+        "Training-free embodied multi-agent cooperation on ThreeDWorld "
+        "Multi-Agent Transport, bundled with the TDW transport challenge controller."
+    ),
     long_description=readme,
-    long_description_content_type='text/markdown',
-    url='https://github.com/alters-mit/magnebot',
-    author='Esther Alter',
-    author_email="alters@mit.edu",
-    keywords='unity simulation tdw robotics agents',
-    packages=find_packages(),
+    long_description_content_type="text/markdown",
+    url="https://github.com/moo-duck-bit/vico_lite_RA-L",
+    keywords="embodied-ai multi-agent tdw simulation clip",
+    packages=find_packages(exclude=("tests", "tests.*")),
+    package_data={"vico_lite.language": ["*.txt"]},
     include_package_data=True,
-    install_requires=required,
+    python_requires=">=3.9",
+    install_requires=requirements,
 )

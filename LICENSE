@@ -19,3 +19,12 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+The `transport_challenge_multi_agent/`, `controllers/`, `scene_generator/`,
+`demo/` and `docs/tdw_api/` directories are vendored from
+https://github.com/alters-mit/transport_challenge_multi_agent (MIT, above).
+The TDW-MAT environment, the RHP and CoELA baselines under `tdw-gym/` and the
+prompts under `LLM/` come from
+https://github.com/UMass-Foundation-Model/Co-LLM-Agents.

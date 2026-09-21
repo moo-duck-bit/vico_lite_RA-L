@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Dict, Sequence
 
 import numpy as np
 import torch
@@ -14,89 +14,75 @@ except ImportError:  # pragma: no cover - runtime dependency
     clip = None  # type: ignore
 
 
+def to_uint8_hwc(image) -> np.ndarray:
+    """Normalise an RGB tensor/array to an HxWx3 uint8 array."""
+    if isinstance(image, torch.Tensor):
+        array = image.detach().cpu().numpy()
+    else:
+        array = np.asarray(image)
+    if array.ndim == 4:
+        array = array[0]
+    if array.ndim != 3:
+        raise ValueError(f"Unexpected image shape {array.shape}")
+    if array.shape[0] in (3, 4) and array.shape[2] not in (3, 4):
+        array = np.transpose(array, (1, 2, 0))
+    array = array[:, :, :3]
+    if array.dtype != np.uint8:
+        array = (np.clip(array.astype(np.float32), 0.0, 1.0) * 255.0).astype(np.uint8)
+    return np.ascontiguousarray(array)
+
+
 class FrozenClipEncoder:
-    """Wrapper around OpenAI CLIP for RGB embedding extraction."""
+    """Frozen CLIP used as a static feature extractor for images and text.
+
+    No parameter of the underlying model is trained or fine-tuned; the encoder
+    only exposes L2-normalised embeddings so that a dot product is a cosine
+    similarity.
+    """
 
     def __init__(self, model_name: str = "ViT-B/32", device: str = "cpu") -> None:
         self.device = device
         self.model, self.preprocess = load_clip(model_name, device=device)
         self.model.requires_grad_(False)
+        self._text_cache: Dict[str, torch.Tensor] = {}
 
-    def encode_image(self, image: torch.Tensor) -> torch.Tensor:
-        """Encode an RGB image tensor/array using CLIP's preprocess."""
-        array: np.ndarray
-        if isinstance(image, torch.Tensor):
-            tensor = image.detach().cpu()
-            if tensor.ndim == 4:
-                tensor = tensor[0]
-            if tensor.size(0) == 3:
-                tensor = tensor.permute(1, 2, 0)
-            array = tensor.numpy()
-        elif isinstance(image, np.ndarray):
-            array = image
-        else:
-            raise ValueError("Unsupported image type for CLIP encoding")
-        if array.ndim == 3 and array.shape[2] == 3:
-            pass
-        elif array.ndim == 3 and array.shape[0] == 3:
-            array = np.transpose(array, (1, 2, 0))
-        else:
-            raise ValueError(f"Unexpected image shape {array.shape}")
-        if array.dtype != np.uint8:
-            array = np.clip(array, 0.0, 1.0)
-            array = (array * 255.0).astype(np.uint8)
-        pil_image = Image.fromarray(array)
+    def encode_images(self, images: Sequence) -> torch.Tensor:
+        """Encode a batch of RGB images into (N, dim) L2-normalised embeddings."""
+        if not images:
+            return torch.empty((0, 0), device=self.device)
+        batch = torch.cat(
+            [self.preprocess(Image.fromarray(to_uint8_hwc(img))).unsqueeze(0) for img in images],
+            dim=0,
+        ).to(self.device)
         with torch.no_grad():
-            processed = self.preprocess(pil_image).unsqueeze(0).to(self.device)
-            features = self.model.encode_image(processed)
-            features = features / features.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-            return features
+            features = self.model.encode_image(batch)
+            return features / features.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+
+    def encode_image(self, image) -> torch.Tensor:
+        """Encode a single RGB image into a (dim,) L2-normalised embedding."""
+        return self.encode_images([image])[0]
 
     def encode_text(self, text: str) -> torch.Tensor:
-        """Encode text using CLIP tokenizer."""
+        """Encode text into a (dim,) L2-normalised embedding.
+
+        The task instruction is constant within an episode, so embeddings are
+        cached per string rather than recomputed every frame.
+        """
         if clip is None:
             raise ImportError(
-                "The 'clip' package is required. Install via pip install git+https://github.com/openai/CLIP.git"
+                "The 'clip' package is required. Install via "
+                "pip install git+https://github.com/openai/CLIP.git"
             )
-        tokens = clip.tokenize([text])
+        cached = self._text_cache.get(text)
+        if cached is not None:
+            return cached
+        tokens = clip.tokenize([text], truncate=True).to(self.device)
         with torch.no_grad():
-            tokens = tokens.to(self.device)
             feature = self.model.encode_text(tokens)
             feature = feature / feature.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-            return feature.squeeze(0)
-
-    def encode_texts(self, texts) -> torch.Tensor:
-        """배치 텍스트 인코딩 → (N, dim) 정규화. 텍스트 문자열 단위로 캐시(매 step 동일 객체명 반복 비용 절감)."""
-        if clip is None:
-            raise ImportError(
-                "The 'clip' package is required. Install via pip install git+https://github.com/openai/CLIP.git"
-            )
-        texts = [str(t) for t in texts]
-        if not texts:
-            return torch.empty((0, 0), device=self.device)
-        if not hasattr(self, "_text_cache"):
-            self._text_cache = {}
-        uniq_missing = [t for t in dict.fromkeys(texts) if t not in self._text_cache]
-        if uniq_missing:
-            tokens = clip.tokenize(uniq_missing, truncate=True).to(self.device)
-            with torch.no_grad():
-                feats = self.model.encode_text(tokens)
-                feats = feats / feats.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-            for t, f in zip(uniq_missing, feats):
-                self._text_cache[t] = f
-        return torch.stack([self._text_cache[t] for t in texts], dim=0)
-
-    def preprocess_image(self, image) -> torch.Tensor:
-        array = image
-        if isinstance(image, torch.Tensor):
-            array = image.detach().cpu().numpy()
-        if isinstance(array, np.ndarray) and array.ndim == 3 and array.shape[0] == 3:
-            array = np.transpose(array, (1, 2, 0))
-        if array.dtype != np.uint8:
-            array = np.clip(array, 0.0, 1.0)
-            array = (array * 255.0).astype(np.uint8)
-        pil = Image.fromarray(array)
-        return self.preprocess(pil).unsqueeze(0)
+        feature = feature.squeeze(0)
+        self._text_cache[text] = feature
+        return feature
 
 
-__all__ = ["FrozenClipEncoder"]
+__all__ = ["FrozenClipEncoder", "to_uint8_hwc"]

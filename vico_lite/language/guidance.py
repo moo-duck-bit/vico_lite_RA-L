@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from ..config import ViCoConfig
-from ..memory.coordination import SharedStateSnapshot
-from ..memory_bridge.controller import MemoryBridgeController
+from ..memory.snapshot import SharedStateSnapshot
+from ..memory.bridge import MemoryBridgeController
 from .reasoner import PolicyReasoner, ReasonerOutput
 
 
@@ -41,9 +41,11 @@ class GuidanceController:
         agent_state: Dict[str, Any],
         extra: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        skip_targets = agent_state.get("skip_targets", {"names": set(), "coords": set()}) or {"names": set(), "coords": set()}
-        names_set = {str(name).lower() for name in skip_targets.get("names", set())}
-        coords_set = {tuple(coord) for coord in skip_targets.get("coords", set())}
+        # Union of what this agent skipped and what the team shares.
+        skip_targets = agent_state.get("skip_targets") or {}
+        names_set = {str(name).lower() for name in skip_targets.get("names", ())}
+        coords_set = {tuple(coord) for coord in skip_targets.get("coords", ())}
+        ids_set = {int(value) for value in skip_targets.get("ids", ()) if value is not None}
         snapshot_skip = getattr(snapshot, "skip_targets", None)
         if isinstance(snapshot_skip, dict):
             for entry in snapshot_skip.get("names", []):
@@ -51,6 +53,9 @@ class GuidanceController:
             for coord in snapshot_skip.get("coords", []):
                 if isinstance(coord, (list, tuple)) and len(coord) >= 2:
                     coords_set.add((float(coord[0]), float(coord[1])))
+            for value in snapshot_skip.get("ids", []):
+                if value is not None:
+                    ids_set.add(int(value))
         names = sorted(names_set)
         coords_sorted = sorted(coords_set)
         coords = [list(coord) for coord in coords_sorted]
@@ -86,7 +91,7 @@ class GuidanceController:
             "recent_actions": memory.recent_actions(5),
             "memory_step": snapshot.step,
             "memory_symbolic": snapshot.symbolic,
-            "skip_targets": {"names": names, "coords": coords},
+            "skip_targets": {"names": names, "coords": coords, "ids": sorted(ids_set)},
             "skip_targets_text": {"names": names, "coords": coord_strings},
         }
         for key in ("task_type", "task_targets", "task_containers", "grabbable_names", "visible_objects", "goal_objects", "scene_bounds"):

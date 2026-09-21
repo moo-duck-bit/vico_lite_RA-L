@@ -15,14 +15,14 @@ if __name__ == "__main__":
                         Path("transport_challenge_multi_agent/replicant_transport_challenge.py").resolve(),
                         Path("transport_challenge_multi_agent/reset_arms.py").resolve(),
                         Path("transport_challenge_multi_agent/transport_challenge.py").resolve()])
-    md.get_docs(output_directory=Path(f"doc"), import_prefix="from transport_challenge_multi_agent")
+    md.get_docs(output_directory=Path("docs/tdw_api"), import_prefix="from transport_challenge_multi_agent")
     # Test links.
     links = MdLinkTester.test_file(Path("README.md"))
     if len(links) > 0:
         print("README.md:")
         for link in links:
             print("\t" + link)
-    for f in Path("doc").iterdir():
+    for f in Path("docs/tdw_api").iterdir():
         if f.suffix == ".md":
             links = MdLinkTester.test_file(f)
             if len(links) > 0:

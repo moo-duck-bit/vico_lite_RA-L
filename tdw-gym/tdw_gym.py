@@ -64,9 +64,9 @@ class TDW(Env):
         self.object_manager = None
         self.occupancy_map = None
         self.gt_mask = gt_mask
-        # Perception ablation: 가시 객체를 매 프레임 확률 P로 무작위 누락(약한 perception 시뮬레이션).
+        # Perception ablation: drop each visible object with probability P per frame.
         self.seg_dropout = float(seg_dropout)
-        self._seg_rng = random.Random(12345)  # 재현성용 고정 시드
+        self._seg_rng = random.Random(12345)  # Fixed seed so a dropout run is reproducible.
         self.satisfied = None
         self.count = 0
         self.reach_threshold = 2
@@ -164,7 +164,7 @@ class TDW(Env):
     
     def obs_filter(self, obs):
         if not self.gt_mask:
-            # 완전 실명: seg_mask 0, visible_objects 비움 (강한 perception의 반대 극단)
+            # Blind condition: blank the mask and report nothing visible.
             new_obs = copy.deepcopy(obs)
             for agent in obs:
                 new_obs[agent]['seg_mask'] = np.zeros_like(new_obs[agent]['seg_mask'])
@@ -175,8 +175,8 @@ class TDW(Env):
                     })
             return new_obs
         if self.seg_dropout and self.seg_dropout > 0.0:
-            # Perception ablation: 가시 객체를 확률 P로 무작위 누락 → seg_mask의 해당 픽셀도 0.
-            # 'strong→weak perception' graded 곡선용 (P=0 완벽 ~ P→1 실명).
+            # Graded perception strength between full (P=0) and blind (P=1):
+            # a dropped object also loses its pixels, so it cannot be localised.
             new_obs = copy.deepcopy(obs)
             for agent in obs:
                 seg = new_obs[agent]['seg_mask']
@@ -185,7 +185,7 @@ class TDW(Env):
                     if o.get('id') is None:
                         continue
                     if self._seg_rng.random() < self.seg_dropout:
-                        # drop: 이 객체의 seg 픽셀을 0으로 (위치계산 get_pc가 못 잡게)
+                        # Clear the object's pixels so get_pc() cannot recover it.
                         col = o.get('seg_color')
                         if col is not None and seg.ndim == 3:
                             m = np.all(seg == np.array(col, dtype=seg.dtype), axis=-1)
@@ -717,19 +717,19 @@ class TDW(Env):
             action = actions[str(replicant_id)]
             if action['type'] == 'ongoing': continue
             
-            # 핵심 수정: type: 9 (continuous movement)가 이미 진행 중이면 새 액션 무시
-            # 이전 move_to_position이 완료되기 전에 새로운 move_to_position이 들어오면 이전 액션이 취소되는 문제 해결
+            # A new move_to_position would cancel the one in flight, so an
+            # equivalent request is dropped while the previous move is ongoing.
             if action["type"] == 9:
-                # 현재 action_buffer에 move_to_position이 있는지 확인
+                # A queued move_to_position counts as ongoing.
                 has_move_to_position = any(
                     buf_action.get('type') == 'move_to_position' 
                     for buf_action in self.action_buffer[replicant_id]
                 )
-                # 또는 현재 실행 중인 액션이 move_to_position인지 확인
+                # So does one the replicant is currently executing.
                 current_action_ongoing = (
                     self.controller.replicants[replicant_id].action.status == ActionStatus.ongoing
                 )
-                # 같은 target_position으로 이동 중인지 확인 (중복 방지)
+                # Only drop the request when it aims at the same destination.
                 new_target_pos = action.get("target_position")
                 if new_target_pos is not None:
                     try:
@@ -740,13 +740,13 @@ class TDW(Env):
                         else:
                             new_target_arr = None
                         
-                        # 버퍼에 있는 move_to_position의 target_position과 비교
+                        # Compare against the queued destination.
                         if has_move_to_position or current_action_ongoing:
                             for buf_action in self.action_buffer[replicant_id]:
                                 if buf_action.get('type') == 'move_to_position':
                                     existing_target = buf_action.get('target_position')
                                     if existing_target is not None and new_target_arr is not None:
-                                        # 거의 같은 위치면 무시 (0.1m 이내)
+                                        # Within 0.1 m counts as the same destination.
                                         if np.linalg.norm(existing_target - new_target_arr) < 0.1:
                                             if hasattr(self, 'logger') and self.logger:
                                                 self.logger.debug(
@@ -757,7 +757,7 @@ class TDW(Env):
                     except Exception:
                         pass
                 
-                # move_to_position이 진행 중이면 새 액션 무시
+                # Keep the ongoing move instead of restarting it.
                 if has_move_to_position or current_action_ongoing:
                     if hasattr(self, 'logger') and self.logger:
                         self.logger.debug(
@@ -765,7 +765,7 @@ class TDW(Env):
                             len(self.action_buffer[replicant_id]),
                             self.controller.replicants[replicant_id].action.status,
                         )
-                    continue  # 새 액션 무시, 이전 액션 계속 진행
+                    continue
             
             # otherwise we start an action directly
             self.action_buffer[replicant_id] = []
@@ -856,18 +856,8 @@ class TDW(Env):
                 finish = True
                 break
             # Check if total frames exceeded max_frame
-            # 주의: challenge.py에서 step 기반 종료를 관리하므로, 여기서는 frame 체크를 비활성화
-            # 대신 max_frames_per_step 체크만 유지 (무한 루프 방지)
-            # if self.num_frames + num_frames >= self.max_frame:
-            #     if hasattr(self, 'logger') and self.logger:
-            #         self.logger.warning(
-            #             "[TDW] step: total frames (%d + %d) >= max_frame (%d), forcing finish",
-            #             self.num_frames,
-            #             num_frames,
-            #             self.max_frame,
-            #         )
-            #     finish = True
-            #     break
+            # The episode-level frame budget is enforced in step()'s epilogue;
+            # this loop only guards against a single step never finishing.
             all_finished = True
             for replicant_id in self.controller.replicants:
                 if delay_frame_count[replicant_id] > 0:

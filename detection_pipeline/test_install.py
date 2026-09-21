@@ -1,7 +1,26 @@
-from mmdet.apis import init_detector, inference_detector
+"""Check that the segmentation model used for non-oracle perception loads.
 
-config_file = './detection_pipeline/config.py'
-checkpoint_file = './detection_pipeline/epoch_1.pth'
-model = init_detector(config_file, checkpoint_file, device='cpu')  # or device='cuda:0'
+Run from the repository root:
 
-print(inference_detector(model, '/home/winnie/dwh/vision/Co-LLM-Agents/envs/tdw_mat/results/vision-single-run2/7/Images/0/0127_0607.png'))
+    python detection_pipeline/test_install.py [image]
+
+Without an argument it runs on one of the bundled demo frames.
+"""
+
+import sys
+
+from mmdet.apis import inference_detector, init_detector
+
+CONFIG = "detection_pipeline/config.py"
+CHECKPOINT = "detection_pipeline/epoch_1.pth"
+DEFAULT_IMAGE = "demo/demo_images/img_0.jpg"
+
+
+def main() -> None:
+    image = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_IMAGE
+    model = init_detector(CONFIG, CHECKPOINT, device="cpu")
+    print(inference_detector(model, image))
+
+
+if __name__ == "__main__":
+    main()

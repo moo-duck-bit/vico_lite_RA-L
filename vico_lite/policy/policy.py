@@ -4,6 +4,7 @@ import json
 import math
 import os
 import random
+import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -13,7 +14,13 @@ from ..config import ViCoConfig
 from ..execution.executor import PlanExecutor
 from ..language.guidance import GuidanceController, GuidanceResult, ReasonedPlan
 from ..language.reasoner import PolicyReasoner
-from ..memory_bridge import MemoryBridgeController, TeamMemoryHub
+from ..memory import MemoryBridgeController, TeamMemoryHub
+
+# Additive bonus that keeps an object required by the task ahead of any other
+# candidate regardless of distance.
+TASK_TARGET_BONUS = 10.0
+# Relevance assumed for an object the encoder did not score this frame.
+DEFAULT_RELEVANCE = 0.2
 
 
 class ViCoPolicy:
@@ -25,8 +32,8 @@ class ViCoPolicy:
         agent_id: int,
         logger,
         agent_memory,
+        memory_hub: TeamMemoryHub,
         env_api: Optional[Dict[str, Any]] = None,
-        memory_hub: Optional[TeamMemoryHub] = None,
         device: str = "cpu",
     ) -> None:
         self.cfg = cfg
@@ -36,7 +43,7 @@ class ViCoPolicy:
         self.env_api = env_api or {}
         self.agent_memory = agent_memory
         self.team_hub = memory_hub
-        self.memory_bridge = MemoryBridgeController(cfg, agent_id=agent_id, device=device, hub=memory_hub)
+        self.memory_bridge = MemoryBridgeController(cfg, agent_id=agent_id, hub=memory_hub, device=device)
         self.reasoner = PolicyReasoner(cfg)
         self.guidance = GuidanceController(cfg, self.reasoner)
         self.executor = PlanExecutor(cfg, agent_id, agent_memory, env_api=self.env_api, logger=logger)
@@ -45,11 +52,11 @@ class ViCoPolicy:
             "subgoal": "search",
             "holding_ids": [],
             "holding_ids_preserve_frame": -1,  # Frame when holding_ids was last preserved
-            "pending_pick_verification": {},  # {pick_id: frame} - pick success 후 held_objects 확인 대기
+            "pending_pick_verification": {},  # {pick_id: frame} awaiting confirmation in held_objects
             "skip_targets": {"names": set(), "coords": set(), "ids": set()},
             "current_room": None,
             "heuristic_streak": 0,
-            "last_explore_positions": [],  # 최근 explore 위치들 (중복 방지)
+            "last_explore_positions": [],  # recently chosen explore targets
         }
         self.last_plan: Optional[GuidanceResult] = None
         self.last_reasoner_frame: int = -self.cfg.reasoner_min_interval
@@ -157,7 +164,6 @@ class ViCoPolicy:
         frame = int(obs.get("current_frames", 0))
         # Store current_frame in agent_state for use by _maybe_force_deliver
         self.agent_state["current_frame"] = frame
-        # 로깅에 agent_id 추가 (디버깅용)
         if self.logger:
             self.logger.debug(f"[Policy] agent_id={self.agent_id} frame={frame} act() called")
         # Reset logged failed objects cache for this frame
@@ -165,12 +171,11 @@ class ViCoPolicy:
         
         # Check for wrong room deliveries: if objects were delivered but not satisfied after 20 frames, retry
         # This handles cases where objects were delivered to the wrong room
-        # IMPORTANT: Check by object name, not object_id, because same-name objects can have different IDs
+        # Match on name, not id: two objects of the same name have different ids.
         if self.env_api and "check_goal" in self.env_api:
             try:
                 finish_info = self.env_api["check_goal"]()
                 if finish_info and isinstance(finish_info, (tuple, list)) and len(finish_info) >= 2:
-                    satisfied_count, total_count = finish_info[0], finish_info[1]
                     pending_deliveries = self.agent_state.get("pending_deliveries", {})
                     if pending_deliveries:
                         # Get satisfied object IDs and their names
@@ -281,7 +286,7 @@ class ViCoPolicy:
         if isinstance(prev_status, int) and last_command == "pick":
             pick_id = self.agent_state.get("last_pick_id")
             if prev_status == 1:
-                # CRITICAL: Check if we actually have the object in held_objects
+                # status 1 can mean the reach succeeded but the grasp did not, so
                 # status == 1 might mean reach_for succeeded, but grasp might have failed
                 held_objects = obs.get("held_objects", []) or []
                 actual_held_ids = []
@@ -312,7 +317,7 @@ class ViCoPolicy:
                                 pick_id,
                                 current_holding_ids,
                             )
-                        # Pick 성공 시 실패 횟수 초기화
+                        # A success clears the failure count.
                         if "pick_fail_count" in self.agent_state and pick_id in self.agent_state["pick_fail_count"]:
                             del self.agent_state["pick_fail_count"][pick_id]
                     # Get object name from visible_objects or object_info
@@ -347,7 +352,7 @@ class ViCoPolicy:
                                 "[Policy] pick pending verification: id=%s (will check held_objects in next frames)",
                                 pick_id,
                             )
-                    # CRITICAL: Clear last_command to prevent re-processing the same pick in next frame
+                    # Clear last_command so the same pick is not reprocessed next frame;
                     # The pick action is done (status=1), we're just waiting for verification
                     # If we don't clear last_command, the same pick will be processed again in next frame
                     self.agent_state.pop("last_command", None)
@@ -393,15 +398,14 @@ class ViCoPolicy:
                                 current_holding_ids,
                             )
                     
-                    # Pick 실패 횟수 추적
+                    # Track how often this object failed.
                     pick_fail_count = self.agent_state.get("pick_fail_count", {}).get(pick_id, 0)
                     pick_fail_count += 1
                     if "pick_fail_count" not in self.agent_state:
                         self.agent_state["pick_fail_count"] = {}
                     self.agent_state["pick_fail_count"][pick_id] = pick_fail_count
                     
-                    # Pick 실패가 3회 이상이면 skip_targets에 추가 (재시도 포기)
-                    # 하지만 3회 미만이면 재시도 가능하도록 skip하지 않음
+                    # Give up on an object after three failed grasps; below that keep retrying.
                     if pick_fail_count >= 3:
                         last_pick_pos = self.agent_state.get("last_pick_pos")
                         if last_pick_pos is not None:
@@ -412,27 +416,23 @@ class ViCoPolicy:
                                 pick_fail_count,
                                 pick_id,
                             )
-                        # object_id도 skip_targets에 추가
                         self._register_skip_target(object_id=pick_id)
-                        # Navigation 관련 state clear (다른 객체로 전환)
+                        # Clear navigation state so another object can be chosen.
                         self.agent_state.pop("last_command", None)
                         self.agent_state.pop("last_pick_id", None)
                         self.agent_state.pop("last_pick_pos", None)
-                        # 실패 횟수 초기화
                         del self.agent_state["pick_fail_count"][pick_id]
                     else:
-                        # 아직 재시도 가능 - state 유지하여 재시도 가능하도록
+                        # Keep last_pick_id/last_pick_pos so the retry can reuse them; clearing
                         if self.logger:
                             self.logger.info(
                                 "[Policy] pick failed %d/3 times for id=%s, will retry (keeping state)",
                                 pick_fail_count,
                                 pick_id,
                             )
-                        # last_pick_id와 last_pick_pos는 유지하여 재시도 가능하도록
-                        # last_command만 clear하여 새로운 navigation 시도 가능
+                        # last_command alone allows a fresh navigation attempt.
                         self.agent_state.pop("last_command", None)
                 else:
-                    # pick_id가 None이면 state clear
                     self.agent_state.pop("last_command", None)
                     self.agent_state.pop("last_pick_id", None)
                     self.agent_state.pop("last_pick_pos", None)
@@ -450,8 +450,9 @@ class ViCoPolicy:
         bridge_output = self.memory_bridge.process(perception_input)
         snapshot = bridge_output["snapshot"]
         visible_infos = perception_input.get("object_infos", [])
-        
-        # 공유된 장애물 좌표를 agent_state에 저장 (다른 에이전트가 감지한 장애물)
+        self._apply_relevance_scores(visible_infos, snapshot)
+
+        # Obstacles reported by the other agent.
         if snapshot and hasattr(snapshot, "obstacle_coords"):
             self.agent_state["shared_obstacle_coords"] = snapshot.obstacle_coords
             if self.logger and snapshot.obstacle_coords:
@@ -461,10 +462,10 @@ class ViCoPolicy:
                     len(snapshot.obstacle_coords),
                 )
             
-            # 공유된 장애물 좌표를 agent_memory의 occupancy_map에 반영하여 pathfinding이 장애물을 피하도록 함
+            # Mark them occupied so A* routes around what the partner already hit.
             if self.agent_memory is not None and snapshot.obstacle_coords:
                 try:
-                    # TTL이 지난 장애물은 제외 (120프레임 = 약 4초)
+                    # Obstacles expire after 120 frames.
                     current_frame = self.agent_state.get("current_frame", frame)
                     obstacle_ttl = 120
                     valid_obstacle_coords = []
@@ -473,23 +474,21 @@ class ViCoPolicy:
                             valid_obstacle_coords.append(coord)
                     
                     if valid_obstacle_coords and hasattr(self.agent_memory, "pos2map") and hasattr(self.agent_memory, "occupancy_map"):
-                        # 공유된 장애물 좌표를 occupancy_map에 반영 (1.0m 반경)
-                        obstacle_radius_cells = int(1.0 / 0.125)  # CELL_SIZE = 0.125, 1.0m 반경
+                        # Block a 1 m radius around each one.
+                        obstacle_radius_cells = int(1.0 / 0.125)  # 1.0 m at CELL_SIZE = 0.125
                         for obs_x, obs_z in valid_obstacle_coords:
                             try:
                                 obs_i, obs_j = self.agent_memory.pos2map(obs_x, obs_z)
                                 height, width = self.agent_memory.occupancy_map.shape
-                                # 반경 내의 모든 셀을 장애물로 표시
                                 for di in range(-obstacle_radius_cells, obstacle_radius_cells + 1):
                                     for dj in range(-obstacle_radius_cells, obstacle_radius_cells + 1):
                                         cell_i = obs_i + di
                                         cell_j = obs_j + dj
                                         if 0 <= cell_i < height and 0 <= cell_j < width:
                                             dist = math.sqrt(di * di + dj * dj) * 0.125  # CELL_SIZE
-                                            if dist <= 1.0:  # 1.0m 이내
-                                                # 장애물로 표시 (1 = occupied)
+                                            if dist <= 1.0:
                                                 self.agent_memory.occupancy_map[cell_i, cell_j] = 1
-                                                # local_occupancy_map도 업데이트 (pathfinding에 사용됨)
+                                                # local_occupancy_map is the one A* reads.
                                                 if hasattr(self.agent_memory, "local_occupancy_map"):
                                                     self.agent_memory.local_occupancy_map[cell_i, cell_j] = 1
                             except Exception as exc:
@@ -513,8 +512,8 @@ class ViCoPolicy:
                             exc,
                         )
         
-        # 핵심 수정: snapshot.team_symbolic에서 task target 정보를 확인하여 visible_infos의 is_task_target 업데이트
-        # _prepare_perception_inputs에서는 _task_target_lookup만 확인하므로, snapshot.team_symbolic의 정보를 반영하지 못함
+        # Promote objects the team already identified as task targets:
+        # _prepare_perception_inputs only consults the local name lookup.
         if snapshot and hasattr(snapshot, "team_symbolic") and snapshot.team_symbolic:
             task_target_ids = set()
             task_target_entries = []
@@ -525,7 +524,6 @@ class ViCoPolicy:
                         task_target_ids.add(obj_id)
                         task_target_entries.append(entry)
             
-            # 디버깅: task_target_ids와 visible_infos의 id 비교
             if self.logger and task_target_ids:
                 visible_ids = {info.get("id") for info in visible_infos if info.get("id") is not None}
                 matched_ids = task_target_ids & visible_ids
@@ -539,16 +537,14 @@ class ViCoPolicy:
                         task_target_ids - visible_ids,
                     )
             
-            # visible_infos의 is_task_target 업데이트
             updated_count = 0
             for info in visible_infos:
                 obj_id = info.get("id")
                 if obj_id is not None and obj_id in task_target_ids:
                     old_is_task_target = info.get("is_task_target", False)
                     info["is_task_target"] = True
-                    # is_grabbable도 True로 설정 (task target은 항상 grabbable)
+                    # A task target is always grabbable.
                     info["is_grabbable"] = True
-                    # priority도 업데이트
                     if "priority" in info:
                         info["priority"] = max(info.get("priority", 0.0), 4.0)
                     else:
@@ -563,7 +559,6 @@ class ViCoPolicy:
                                 info.get("name"),
                             )
             
-            # 디버깅: 업데이트 결과 확인
             if self.logger and task_target_ids:
                 final_task_target_count = sum(1 for info in visible_infos if info.get("is_task_target"))
                 if final_task_target_count == 0 and updated_count == 0:
@@ -576,16 +571,12 @@ class ViCoPolicy:
                     )
         # Check if navigation completed and we should retry pick
         # If last_command was navigation (move/search) and status indicates completion, retry pick if we were trying to pick
-        # 방안 1: Navigation 완료 후 Pick Retry 강화
-        # Navigation이 완료되면 (prev_status가 1, success) 자동으로 pick retry
-        # type: 9 (continuous movement)도 navigation으로 간주
+        # Retry the pick once navigation finishes.
+        # Continuous movement (type 9) counts as navigation.
         is_navigation_command = last_command in ("0", "1", "2", "move", "search", "continuous_move", 9, "9")
         if is_navigation_command and isinstance(prev_status, int):
             last_pick_id = self.agent_state.get("last_pick_id")
             last_pick_pos = self.agent_state.get("last_pick_pos")
-            # Navigation 완료 감지: prev_status가 1 (success)이면 완료로 간주
-            # prev_status가 0 (ongoing)이면 아직 진행 중이므로 retry하지 않음
-            # type: 9의 경우 ActionStatus.success가 1로 매핑됨
             if self.logger and last_pick_id is not None:
                 self.logger.debug(
                     "[Policy] navigation retry check: last_command=%s prev_status=%s (type=%s) last_pick_id=%s frame=%s",
@@ -595,14 +586,12 @@ class ViCoPolicy:
                     last_pick_id,
                     frame,
                 )
-            # Navigation 완료 또는 실패 시 거리 확인 후 pick retry
-            # prev_status == 1: success (완료)
-            # prev_status == 2: failure (실패) - last_command를 clear하고 새로운 navigation 시도 가능하도록
-            # prev_status == 0: ongoing (진행 중) - 너무 오래 지속되면 (20프레임 이상) 실패로 간주
+            # status 1 finished, 2 failed, 0 is still ongoing and is treated as a
+            # failure once it has run for more than 20 frames.
             should_check_distance = False
             should_clear_navigation = False
             last_nav_frame = self.agent_state.get("last_nav_start_frame", -1)
-            # last_nav_start_frame이 -1이면 현재 프레임으로 설정 (타임아웃 체크를 위해)
+            # Seed the timeout clock on the first frame we see this navigation.
             if last_nav_frame < 0 and prev_status == 0:
                 last_nav_frame = frame
                 self.agent_state["last_nav_start_frame"] = frame
@@ -613,17 +602,17 @@ class ViCoPolicy:
                     )
             
             if last_pick_id is not None:
-                if prev_status == 1:  # Success - 완료
+                if prev_status == 1:  # Success
                     should_check_distance = True
-                    # Navigation 성공 시 실패 횟수 및 방법 초기화
+                    # Success resets the failure count and the chosen method.
                     if "nav_fail_count" in self.agent_state and last_pick_id in self.agent_state["nav_fail_count"]:
                         del self.agent_state["nav_fail_count"][last_pick_id]
                     if "nav_method" in self.agent_state and last_pick_id in self.agent_state["nav_method"]:
                         del self.agent_state["nav_method"][last_pick_id]
-                elif prev_status == 2:  # Failure - 실패했지만 거리 확인 후 clear
+                elif prev_status == 2:  # Failure: check the distance before clearing
                     should_check_distance = True
-                    should_clear_navigation = True  # 실패했으므로 navigation clear
-                    # 장애물 감지: 현재 위치를 공유 메모리에 저장
+                    should_clear_navigation = True
+                    # Share the blocking position with the team.
                     if self.team_hub is not None and hasattr(self.agent_memory, "position") and self.agent_memory.position is not None:
                         try:
                             agent_pos = self.agent_memory.position
@@ -640,7 +629,7 @@ class ViCoPolicy:
                         except Exception as exc:
                             if self.logger:
                                 self.logger.debug("[Policy] failed to save obstacle to shared memory: %s", exc)
-                    # 핵심 수정: Navigation이 실패한 목표 위치를 blocked_coords에 추가하여 다시 시도하지 않도록 함
+                    # Remember the unreachable destination so it is not retried.
                     if last_pick_pos is not None:
                         try:
                             blocked_coords = self.agent_state.get("blocked_coords", set())
@@ -662,11 +651,10 @@ class ViCoPolicy:
                             "[Policy] navigation failed (prev_status=2), checking distance for pick retry id=%s, will clear navigation",
                             last_pick_id,
                         )
-                elif prev_status == 0:  # Ongoing - 너무 오래 지속되면 실패로 간주
-                    # Continuous movement가 너무 오래 지속되면 (20프레임 이상) 실패로 간주
+                elif prev_status == 0:  # Ongoing: treated as failure once it runs too long
                     if last_nav_frame >= 0 and frame - last_nav_frame >= 20:
                         should_check_distance = True
-                        should_clear_navigation = True  # 너무 오래 지속되면 실패로 간주
+                        should_clear_navigation = True
                         if self.logger:
                             self.logger.warning(
                                 "[Policy] navigation ongoing for %d frames (>=20), treating as failure and clearing navigation id=%s",
@@ -674,8 +662,8 @@ class ViCoPolicy:
                                 last_pick_id,
                             )
             elif prev_status == 0 and last_nav_frame >= 0:
-                # last_pick_id가 없어도 ongoing 상태가 너무 오래 지속되면 clear (일반 navigation 타임아웃)
-                if frame - last_nav_frame >= 30:  # pick이 아닌 일반 navigation은 30프레임 타임아웃
+                # Plain navigation times out after 30 frames.
+                if frame - last_nav_frame >= 30:
                     should_clear_navigation = True
                     if self.logger:
                         self.logger.warning(
@@ -688,12 +676,11 @@ class ViCoPolicy:
                 distance = None
                 obj_name = None
                 
-                # First try to find object in visible_infos (가장 정확)
+                # visible_infos carries the most accurate position, so try it first.
                 if visible_infos:
                     for info in visible_infos:
                         if info.get("id") == last_pick_id and info.get("is_grabbable"):
                             distance = info.get("distance")
-                            # 거리 임계값을 2.5m로 완화
                             if distance is not None and distance <= 2.5:
                                 target_pos = self._normalise_position(info.get("position"))
                                 if target_pos is None:
@@ -712,7 +699,6 @@ class ViCoPolicy:
                             else:
                                 distance = float(np.linalg.norm(agent_pos - pick_pos_arr))
                             
-                            # 거리 임계값을 2.5m로 완화
                             if distance is not None and distance <= 2.5:
                                 target_pos = last_pick_pos
                                 if self.logger:
@@ -733,10 +719,8 @@ class ViCoPolicy:
                 # Use 2.5m threshold to allow some margin (executor will check actual distance)
                 pick_distance_threshold = 2.5
                 
-                # 핵심 수정: Navigation 실패 시에도 object_id만으로 pick 시도
-                # target_pos가 None이거나 거리가 멀어도 object_id가 있으면 reach_for 사용
-                # BUT: 이미 holding 중인 object는 다시 pick 시도하지 않음
-                # AND: task target이 아닌 object는 pick 시도하지 않음
+                # Even after a failed navigation, an object id alone is enough for
+                # reach_for -- provided the object is a task target we are not already holding.
                 if target_pos is None and last_pick_id is not None:
                     # Check if we're already holding this object
                     holding_ids = self.agent_state.get("holding_ids", [])
@@ -798,7 +782,7 @@ class ViCoPolicy:
                                 last_pick_id,
                             )
                         # Clear navigation state but continue to force_pick/explore fallback
-                        # IMPORTANT: Always clear last_pick_id if not a task target, even if should_clear_navigation is False
+                        # A non-task target always releases last_pick_id.
                         self.agent_state.pop("last_command", None)
                         self.agent_state.pop("last_nav_start_frame", None)
                         self.agent_state.pop("last_pick_id", None)
@@ -810,8 +794,7 @@ class ViCoPolicy:
                             del self.agent_state["nav_method"][last_pick_id]
                         # Don't return here - continue to force_pick/explore fallback
                     
-                    # Navigation이 실패했지만 object_id가 있고 task target이면 reach_for로 pick 시도
-                    # reach_for는 자동으로 navigation을 수행하므로 거리 제한이 덜 엄격함
+                    # reach_for runs its own navigation, so the distance limit is looser.
                     if self.logger:
                         self.logger.info(
                             "[Policy] navigation failed but object_id=%s exists and is task target, attempting pick with reach_for (no position)",
@@ -838,7 +821,6 @@ class ViCoPolicy:
                         self.agent_state["last_command"] = "pick"
                         self.agent_state["last_pick_id"] = last_pick_id
                         self.agent_state["last_pick_pos"] = None  # No position
-                    # Navigation state clear (pick 시도했으므로)
                     if should_clear_navigation:
                         self.agent_state.pop("last_command", None)
                         self.agent_state.pop("last_nav_start_frame", None)
@@ -884,7 +866,7 @@ class ViCoPolicy:
                                 obj_name or f"object_{last_pick_id}",
                                 distance,
                                 pick_distance_threshold,
-                                nav_fail_count,
+                                self.agent_state.get("nav_fail_count", {}).get(last_pick_id, 0),
                                 prev_status,
                             )
                         else:
@@ -923,7 +905,6 @@ class ViCoPolicy:
                         del self.agent_state["nav_fail_count"][last_pick_id]
                     return command
                 elif distance is not None and distance > pick_distance_threshold:
-                    # Navigation 실패 횟수 추적
                     nav_fail_count = self.agent_state.get("nav_fail_count", {}).get(last_pick_id, 0)
                     nav_method = self.agent_state.get("nav_method", {}).get(last_pick_id, None)  # 'continuous' or 'discrete'
                     
@@ -958,21 +939,18 @@ class ViCoPolicy:
                             del self.agent_state["nav_method"][last_pick_id]
                         return {"type": "ongoing"}
                     
-                    # Navigation이 실패했지만 거리가 여전히 접근 가능한 범위이면 재시도
-                    # TDW의 pick_up은 1.5m 제한이 있으므로, 1.5m 이내로 접근할 때까지 navigation 시도
-                    max_distance_for_retry = 5.0  # 5m 이내면 계속 시도
-                    max_fail_count = 8  # 최대 8회까지 재시도
+                    # Keep approaching while the target is within 5 m and under 8 failures;
+                    # TDW's pick_up only reaches 1.5 m.
+                    max_distance_for_retry = 5.0
+                    max_fail_count = 8
                     
                     if distance <= max_distance_for_retry and nav_fail_count < max_fail_count:
-                        # Navigation 실패 횟수 증가
                         if "nav_fail_count" not in self.agent_state:
                             self.agent_state["nav_fail_count"] = {}
                         self.agent_state["nav_fail_count"][last_pick_id] = nav_fail_count + 1
                         
-                        # Navigation 방법 전환: continuous <-> discrete
-                        # 같은 방법이 계속 실패하면 다른 방법 시도
+                        # Alternate between continuous and discrete movement when one keeps failing.
                         if nav_fail_count >= 3 and nav_fail_count % 2 == 1:
-                            # 3회 이상 실패하고 홀수 회차면 방법 전환
                             new_method = "discrete" if nav_method == "continuous" else "continuous"
                             if "nav_method" not in self.agent_state:
                                 self.agent_state["nav_method"] = {}
@@ -987,11 +965,10 @@ class ViCoPolicy:
                                     last_pick_id,
                                 )
                         else:
-                            # 방법 유지
                             if "nav_method" not in self.agent_state:
                                 self.agent_state["nav_method"] = {}
                             if last_pick_id not in self.agent_state["nav_method"]:
-                                # 첫 시도면 continuous 시도 (거리가 멀면)
+                                # Start with continuous movement when the target is far.
                                 self.agent_state["nav_method"][last_pick_id] = "continuous" if distance > 3.0 else "discrete"
                         
                         if self.logger:
@@ -1004,9 +981,8 @@ class ViCoPolicy:
                                 self.agent_state["nav_method"].get(last_pick_id, "unknown"),
                                 last_pick_id,
                             )
-                        # Navigation 재시도: 새로운 pick plan 생성하여 navigation부터 다시 시도
-                        # TDW의 pick_up은 1.5m 제한이 있으므로, 1.5m 이내로 접근할 때까지 navigation 시도
-                        # target_pos가 None이면 last_pick_pos 사용, 그것도 None이면 object_id만으로 시도
+                        # Rebuild the pick plan; without a position it falls through to force_pick.
+                        # TDW's pick_up only reaches 1.5 m.
                         retry_target_pos = target_pos if target_pos is not None else last_pick_pos
                         pick_plan = ReasonedPlan(
                             action_type="pick",
@@ -1020,27 +996,25 @@ class ViCoPolicy:
                                 "prev_status": prev_status,
                                 "nav_fail_count": nav_fail_count + 1,
                                 "nav_method": self.agent_state["nav_method"].get(last_pick_id, "unknown"),
-                                "is_task_target": True,  # Navigation 재시도는 task target에 대한 것이므로
-                                "override": "near_grabbable" if retry_target_pos is None else None,  # position이 없으면 force_pick으로 처리
+                                "is_task_target": True,
+                                "override": "near_grabbable" if retry_target_pos is None else None,
                             },
                         )
                         command, exec_meta = self.executor.execute(pick_plan, snapshot, self.agent_state)
                         self.agent_state.setdefault("recent_meta", []).append(exec_meta)
                         command_type = command.get("type") if isinstance(command, dict) else None
-                        # Navigation 명령이면 last_command 업데이트
                         if command_type in (0, 1, 2, 9):
                             self.agent_state["last_command"] = str(command_type) if command_type != 9 else "continuous_move"
                             self.agent_state["last_pick_id"] = last_pick_id
                             self.agent_state["last_pick_pos"] = target_pos
                             self.agent_state["last_nav_start_frame"] = frame
-                        # Pick 명령이면 (거리가 충분히 가까워진 경우)
                         elif command_type == 3:
                             self.agent_state["last_command"] = "pick"
                             self.agent_state["last_pick_id"] = last_pick_id
                             self.agent_state["last_pick_pos"] = target_pos
                         return command
                     else:
-                        # 너무 많이 실패했거나 거리가 너무 멀면 clear
+                        # Too many failures or too far away: abandon this target.
                         if self.logger:
                             self.logger.warning(
                                 "[Policy] navigation failed too many times or too far (dist=%.2f > %.2fm or fail_count=%d >= %d), giving up pick id=%s",
@@ -1050,12 +1024,10 @@ class ViCoPolicy:
                                 max_fail_count,
                                 last_pick_id,
                             )
-                        # Navigation 실패 횟수 및 방법 초기화
                         if "nav_fail_count" in self.agent_state and last_pick_id in self.agent_state["nav_fail_count"]:
                             del self.agent_state["nav_fail_count"][last_pick_id]
                         if "nav_method" in self.agent_state and last_pick_id in self.agent_state["nav_method"]:
                             del self.agent_state["nav_method"][last_pick_id]
-                        # 거리가 너무 멀면 navigation clear (새로운 navigation 시도 가능하도록)
                         if should_clear_navigation:
                             if self.logger:
                                 self.logger.debug(
@@ -1067,7 +1039,6 @@ class ViCoPolicy:
                             self.agent_state.pop("last_pick_id", None)
                             self.agent_state.pop("last_pick_pos", None)
                             self.agent_state.pop("last_nav_start_frame", None)
-            # Navigation이 실패했거나 타임아웃되었으면 clear
             if should_clear_navigation and not should_check_distance:
                 if self.logger:
                     self.logger.debug(
@@ -1078,8 +1049,8 @@ class ViCoPolicy:
                 self.agent_state.pop("last_pick_pos", None)
                 self.agent_state.pop("last_nav_start_frame", None)
         
-        # Deliver 액션의 navigation 실패 처리 (장애물 감지 시에도 거리 확인하여 put_in 시도)
-        # Pick 액션과 달리 Deliver는 3.0m 이내면 put_in 가능하므로 더 관대하게 처리
+        # A blocked delivery is still worth attempting: put_in reaches 3 m, which
+        # is more forgiving than a pick.
         last_command = self.agent_state.get("last_command")
         last_deliver_id = self.agent_state.get("last_deliver_id")
         last_deliver_pos = self.agent_state.get("last_deliver_pos")
@@ -1089,11 +1060,10 @@ class ViCoPolicy:
             isinstance(prev_status, int)
         )
         
-        if is_deliver_navigation and prev_status == 2:  # Navigation 실패 (장애물 감지)
-            # Deliver 실패 횟수 추적
+        if is_deliver_navigation and prev_status == 2:  # Blocked on the way to the goal
             deliver_fail_count = self.agent_state.get("deliver_fail_count", {}).get(last_deliver_id, 0)
             
-            # 핵심 수정: deliver_fail_count가 너무 높으면 (50 이상) deliver를 포기하고 다른 작업 시도
+            # After 50 failures, stop trying to deliver and do something else.
             max_deliver_fail_count = 50
             if deliver_fail_count >= max_deliver_fail_count:
                 if self.logger:
@@ -1103,7 +1073,6 @@ class ViCoPolicy:
                         max_deliver_fail_count,
                         last_deliver_id,
                     )
-                # Deliver 실패 횟수 초기화
                 if "deliver_fail_count" in self.agent_state and last_deliver_id in self.agent_state["deliver_fail_count"]:
                     del self.agent_state["deliver_fail_count"][last_deliver_id]
                 # Navigation state clear
@@ -1114,14 +1083,11 @@ class ViCoPolicy:
                 # Continue to force_pick/explore fallback
                 # Don't return here - continue to force_pick/explore fallback
             
-            # 거리 임계값 동적 조정: 실패가 많을수록 더 관대하게 (2.5m -> 3.0m)
-            # TDW PutIn은 3.0m 이내면 가능하므로, 실패가 많으면 3.0m까지 허용
-            base_threshold = 2.5  # 기본 임계값 (goal_position의 경우)
-            max_threshold = 3.0   # 최대 임계값 (TDW PutIn 제한)
-            # 실패 횟수에 따라 임계값 증가 (최대 3.0m)
+            # Relax the distance threshold with repeated failures, up to TDW's 3 m limit.
+            base_threshold = 2.5
+            max_threshold = 3.0
             distance_threshold = min(base_threshold + (deliver_fail_count * 0.1), max_threshold)
             
-            # goal_position_id인지 확인
             goal_position_id = None
             if self.env_api is not None:
                 if isinstance(self.env_api, dict):
@@ -1131,11 +1097,10 @@ class ViCoPolicy:
             
             is_goal_position = (goal_position_id is not None and last_deliver_id == goal_position_id)
             if not is_goal_position:
-                # goal_position이 아니면 기본 임계값 2.0m 사용
+                # Containers other than the goal use a tighter 2 m threshold.
                 base_threshold = 2.0
                 distance_threshold = min(base_threshold + (deliver_fail_count * 0.1), max_threshold)
             
-            # 현재 위치에서 goal_position까지의 거리 계산
             actual_distance = float("inf")
             if self.agent_memory is not None and hasattr(self.agent_memory, "position") and self.agent_memory.position is not None:
                 try:
@@ -1143,7 +1108,6 @@ class ViCoPolicy:
                     if isinstance(agent_pos, (list, tuple, np.ndarray)) and len(agent_pos) >= 3:
                         agent_arr = np.array([agent_pos[0], agent_pos[2]])
                         
-                        # goal_position_id의 실제 위치 가져오기
                         if is_goal_position and goal_position_id is not None:
                             goal_pos = None
                             if hasattr(self.agent_memory, "object_info") and goal_position_id in self.agent_memory.object_info:
@@ -1163,16 +1127,13 @@ class ViCoPolicy:
                                     goal_arr = np.array([goal_pos[0], goal_pos[2]])
                                     actual_distance = float(np.linalg.norm(agent_arr - goal_arr))
                         elif last_deliver_pos is not None:
-                            # last_deliver_pos 사용
                             target_arr = np.array([last_deliver_pos[0], last_deliver_pos[2] if len(last_deliver_pos) > 2 else last_deliver_pos[1]])
                             actual_distance = float(np.linalg.norm(agent_arr - target_arr))
                 except Exception as exc:
                     if self.logger:
                         self.logger.debug("[Policy] deliver: failed to calculate actual distance: %s", exc)
             
-            # 장애물 감지 시에도 거리 확인하여 put_in 시도
             if actual_distance <= distance_threshold:
-                # 거리가 임계값 이내면 put_in 시도
                 if self.logger:
                     self.logger.info(
                         "[Policy] deliver navigation failed (prev_status=2) but close enough (dist=%.2f <= %.2fm, fail_count=%d), attempting put_in",
@@ -1181,12 +1142,10 @@ class ViCoPolicy:
                         deliver_fail_count,
                     )
                 
-                # Deliver 실패 횟수 증가
                 if "deliver_fail_count" not in self.agent_state:
                     self.agent_state["deliver_fail_count"] = {}
                 self.agent_state["deliver_fail_count"][last_deliver_id] = deliver_fail_count + 1
                 
-                # put_in 액션 생성
                 deliver_plan = ReasonedPlan(
                     action_type="deliver",
                     target_id=last_deliver_id,
@@ -1208,11 +1167,9 @@ class ViCoPolicy:
                     self.agent_state["last_command"] = "deliver"
                     self.agent_state["last_deliver_id"] = last_deliver_id
                     self.agent_state["last_deliver_pos"] = last_deliver_pos
-                # Navigation state clear (deliver 시도했으므로)
                 self.agent_state.pop("last_nav_start_frame", None)
                 return command
             else:
-                # 거리가 너무 멀면 실패 횟수만 증가하고 navigation clear
                 if self.logger:
                     self.logger.warning(
                         "[Policy] deliver navigation failed (prev_status=2) and too far (dist=%.2f > %.2fm, fail_count=%d), clearing navigation",
@@ -1220,7 +1177,6 @@ class ViCoPolicy:
                         distance_threshold,
                         deliver_fail_count,
                     )
-                # Deliver 실패 횟수 증가
                 if "deliver_fail_count" not in self.agent_state:
                     self.agent_state["deliver_fail_count"] = {}
                 self.agent_state["deliver_fail_count"][last_deliver_id] = deliver_fail_count + 1
@@ -1230,12 +1186,10 @@ class ViCoPolicy:
                 self.agent_state.pop("last_deliver_pos", None)
                 self.agent_state.pop("last_nav_start_frame", None)
         
-        # 방안 5: 에이전트가 아무것도 보지 못할 때 처리
-        # 연속으로 visible_infos가 비어있으면 위치 변경 필요
+        # After five consecutive blind frames the agent must move somewhere new.
         if not visible_infos or len(visible_infos) == 0:
             no_vision_count = self.agent_state.get("no_vision_count", 0) + 1
             self.agent_state["no_vision_count"] = no_vision_count
-            # 5회 이상 연속으로 아무것도 보지 못하면 explore로 위치 변경
             if no_vision_count >= 5:
                 if self.logger:
                     self.logger.warning(
@@ -1243,27 +1197,24 @@ class ViCoPolicy:
                         frame,
                         no_vision_count,
                     )
-                # Explore로 위치 변경 - 더 적극적으로 다른 위치로 이동
-                # blocked_coords를 추가하여 같은 위치로 이동하지 않도록 함
+                # Block the current position so exploration picks a different one.
                 blocked_coords = self.agent_state.get("blocked_coords", set())
                 # Get agent position from obs, not snapshot (snapshot is SharedStateSnapshot dataclass)
                 current_pos = obs.get("agent_position") or obs.get("position")
                 if current_pos:
-                    blocked_coords.add(tuple(current_pos[:2]))  # (x, z) 좌표만 사용
+                    blocked_coords.add(tuple(current_pos[:2]))
                     self.agent_state["blocked_coords"] = blocked_coords
                 
                 explore_plan = ReasonedPlan("search", None, None, 0.5, {"reason": "no_vision_for_too_long"})
-                # _ensure_plan_target은 내부에서 blocked_coords를 계산함
                 explore_plan = self._ensure_plan_target(explore_plan)
                 
-                # explore_plan이 idle이면 추가 fallback 시도
                 if explore_plan.action_type == "idle":
                     if self.logger:
                         self.logger.warning(
                             "[Policy] frame=%s explore plan returned idle after no_vision, trying team_symbolic fallback",
                             frame,
                         )
-                    # team_symbolic에서 task_target 찾기
+                    # Look for a task target in the shared object table.
                     target_found = False
                     if snapshot and hasattr(snapshot, "team_symbolic") and snapshot.team_symbolic:
                         skip_targets = self.agent_state.get("skip_targets", {"names": set(), "coords": set(), "ids": set()})
@@ -1334,16 +1285,15 @@ class ViCoPolicy:
                                     if self.logger:
                                         self.logger.debug("[Policy] failed to create plan from team_symbolic entry: %s", exc)
                     
-                    # team_symbolic에서도 찾지 못했으면 랜덤 이동 시도
+                    # Nothing in shared memory either: move somewhere at random.
                     if not target_found and current_pos:
                         try:
                             agent_arr = np.array(current_pos) if isinstance(current_pos, (list, tuple, np.ndarray)) else current_pos
                             if isinstance(agent_arr, np.ndarray) and agent_arr.shape[0] >= 3:
                                 agent_x = float(agent_arr[0])
                                 agent_z = float(agent_arr[2])
-                                import random
                                 angle = random.uniform(0, 2 * math.pi)
-                                distance = random.uniform(3.0, 5.0)  # 더 멀리 이동
+                                distance = random.uniform(3.0, 5.0)
                                 random_x = agent_x + distance * math.cos(angle)
                                 random_z = agent_z + distance * math.sin(angle)
                                 if hasattr(self.agent_memory, "_scene_bounds"):
@@ -1383,7 +1333,6 @@ class ViCoPolicy:
                 # If still idle, try to move to a random position far from current position
                 if explore_plan.action_type == "idle" and current_pos and no_vision_count >= 10:
                     # Move to a position far from current position (e.g., opposite side of room)
-                    import random
                     if hasattr(self, 'env_api') and self.env_api:
                         room_bounds = self.env_api.get("room_bounds")
                         if room_bounds:
@@ -1407,9 +1356,9 @@ class ViCoPolicy:
                     self.agent_state["no_vision_count"] = 0
                     return command
         else:
-            # Vision이 있으면 카운터 리셋
+            # Seeing something again resets the counter and
             self.agent_state["no_vision_count"] = 0
-            # Vision이 있으면 blocked_coords도 일부 클리어 (최근 것만 유지)
+            # releases all but the most recent blocked positions.
             blocked_coords = self.agent_state.get("blocked_coords", set())
             if len(blocked_coords) > 10:
                 # Keep only the 5 most recent blocked coordinates
@@ -1469,13 +1418,7 @@ class ViCoPolicy:
                 team_count,
                 partner_count,
             )
-        # LLM 비활성화: 항상 휴리스틱만 사용 (코드는 유지하되 호출하지 않음)
-        # force_llm = bool(self.agent_state.pop("force_llm", False))
-        # force_heuristics = frame - self.last_reasoner_frame < self.cfg.reasoner_min_interval
-        # if force_llm:
-        #     force_heuristics = False
-        #     context_extra["force_llm"] = True
-        force_heuristics = True  # 항상 휴리스틱만 사용
+        force_heuristics = self.cfg.force_heuristics
         guidance_context = self.guidance.build_context(
             agent_id=self.agent_id,
             frame=frame,
@@ -1496,24 +1439,6 @@ class ViCoPolicy:
                 dbg.get("candidate_count"),
                 dbg.get("llm_error"),
             )
-        # LLM 비활성화: heuristic_streak 로직 제거 (LLM 강제 호출 방지)
-        # streak = int(self.agent_state.get("heuristic_streak", 0))
-        # if guidance.source == "llm":
-        #     streak = 0
-        # else:
-        #     streak += 1
-        #     threshold = max(4, self.cfg.reasoner_plan_horizon // 3 or 1)
-        #     if streak >= threshold:
-        #         self.agent_state["force_llm"] = True
-        #         self.last_reasoner_frame = frame - self.cfg.reasoner_min_interval - 1
-        #         if self.logger:
-        #             self.logger.debug(
-        #                 "[Policy] heuristic streak %s reached threshold %s -> forcing LLM refresh",
-        #                 streak,
-        #                 threshold,
-        #             )
-        #         streak = 0
-        # self.agent_state["heuristic_streak"] = streak
         override_used = False
         plan = guidance.plan
         holding_ids = self.agent_state.get("holding_ids", [])
@@ -1531,15 +1456,12 @@ class ViCoPolicy:
                 for entry in held_objects:
                     if entry and entry.get("id") is not None:
                         actual_holding_ids.append(entry.get("id"))
-                # 개선: holding_ids가 있으면 deliver 시도 (actual_holding_ids가 없어도)
-                # TDW에서 held_objects 업데이트가 지연될 수 있으므로, holding_ids를 신뢰
+                # held_objects can lag behind, so trust holding_ids and only prefer
+                # actual_holding_ids when the environment confirms it.
                 preserve_frame = self.agent_state.get("holding_ids_preserve_frame", -1)
                 current_frame = obs.get("current_frames", 0)
-                # can_deliver 조건 완화: holding_ids가 있으면 deliver 시도
-                # actual_holding_ids가 있으면 우선 사용, 없으면 holding_ids 사용
                 can_deliver = bool(actual_holding_ids) or bool(holding_ids) or (preserve_frame >= 0 and (current_frame - preserve_frame) < 20)
                 if can_deliver:
-                    # actual_holding_ids가 없으면 holding_ids 사용
                     deliver_holding_ids = actual_holding_ids if actual_holding_ids else holding_ids
                     deliver_plan = self._maybe_force_deliver(visible_infos, actual_holding_ids=deliver_holding_ids)
                 if deliver_plan is not None:
@@ -1797,7 +1719,7 @@ class ViCoPolicy:
                                         exc,
                                         exc_info=True,
                                     )
-                                # 예외 발생 시 idle plan 반환하여 fallback 로직으로 넘어가도록 함
+                                # Return idle so the fallback below takes over.
                                 explore_plan = ReasonedPlan("idle", None, None, 0.0, {"reason": "_ensure_plan_target_exception", "error": str(exc)})
                                 if self.logger:
                                     self.logger.warning(
@@ -1808,21 +1730,19 @@ class ViCoPolicy:
                                 plan = explore_plan
                                 override_used = True
                             else:
-                                # explore()가 실패했을 때 team_symbolic에서 task_target 위치로 이동 시도
+                                # Exploration failed: head for a task target from shared memory instead.
                                 if self.logger:
                                     self.logger.warning(
                                         "[Policy] frame=%s explore fallback returned idle, trying to move to task_target from team_symbolic",
                                         frame,
                                     )
-                                # team_symbolic에서 task_target 찾기 (자신에게 할당된 것만)
+                                # Only consider targets assigned to this agent.
                                 target_found = False
                                 if snapshot and hasattr(snapshot, "team_symbolic") and snapshot.team_symbolic:
                                     skip_targets = self.agent_state.get("skip_targets", {"names": set(), "coords": set(), "ids": set()})
                                     skip_ids = skip_targets.get("ids", set()) if isinstance(skip_targets, dict) else set()
-                                    # 자신에게 할당된 task_target만 선택 (다른 에이전트가 이미 향하고 있는 것은 제외)
                                     task_target_assignments = self.agent_state.get("task_target_assignments", {})
                                     
-                                    # task_target 중에서 위치 정보가 있고 자신에게 할당된 것 찾기
                                     best_entry = None
                                     best_score = -1.0
                                     for entry in snapshot.team_symbolic:
@@ -1831,11 +1751,10 @@ class ViCoPolicy:
                                         entry_id = entry.get("id")
                                         if entry_id is not None and entry_id in skip_ids:
                                             continue
-                                        # 핵심: 자신에게 할당된 task_target만 선택
                                         if entry_id is not None and task_target_assignments:
                                             assigned_agent = task_target_assignments.get(entry_id)
                                             if assigned_agent is not None and assigned_agent != self.agent_id:
-                                                # 다른 에이전트에게 할당된 것은 건너뛰기
+                                                # Skip anything the partner has claimed.
                                                 if self.logger:
                                                     self.logger.debug(
                                                         "[Policy] frame=%s skipping task_target id=%s (assigned to agent%d, not agent%d)",
@@ -1846,10 +1765,10 @@ class ViCoPolicy:
                                                     )
                                                 continue
                                         
-                                        # 위치 정보가 있는 entry 우선
+                                        # Prefer entries that already carry a position.
                                         entry_position = entry.get("position") or entry.get("location")
                                         if entry_position is None:
-                                            # 위치 정보가 없으면 agent_memory에서 조회 시도
+                                            # Otherwise look it up in local memory.
                                             if self.agent_memory and hasattr(self.agent_memory, "object_info") and entry_id is not None:
                                                 obj_info = self.agent_memory.object_info.get(entry_id)
                                                 if obj_info:
@@ -1858,12 +1777,10 @@ class ViCoPolicy:
                                         if entry_position is None:
                                             continue
                                         
-                                        # 위치 정보 정규화
                                         normalized_pos = self._normalise_position(entry_position)
                                         if normalized_pos is None:
                                             continue
                                         
-                                        # 점수 계산: 위치 정보가 있으면 높은 점수
                                         entry_score = 1.0
                                         if normalized_pos is not None:
                                             entry_score += 5.0
@@ -1876,13 +1793,12 @@ class ViCoPolicy:
                                                 "position": normalized_pos,
                                             }
                                     
-                                    # 찾은 task_target으로 이동
                                     if best_entry:
                                         target_pos = best_entry["position"]
                                         if isinstance(target_pos, (list, tuple, np.ndarray)) and len(target_pos) >= 3:
                                             try:
                                                 target_pos_tuple = (float(target_pos[0]), float(target_pos[1]), float(target_pos[2]))
-                                                # Map bounds와 room 체크는 _ensure_plan_target에서 수행
+                                                # Bounds and room checks happen in _ensure_plan_target.
                                                 team_target_plan = ReasonedPlan(
                                                     "move",
                                                     best_entry["id"],
@@ -1905,14 +1821,13 @@ class ViCoPolicy:
                                                 if self.logger:
                                                     self.logger.debug("[Policy] failed to create plan from team_symbolic entry: %s", exc)
                                 
-                                # team_symbolic에서 찾지 못했을 때만 랜덤 이동 시도
                                 if not target_found:
                                     if self.logger:
                                         self.logger.warning(
                                             "[Policy] frame=%s no task_target found in team_symbolic, trying random movement as last resort",
                                             frame,
                                         )
-                                    # Agent의 현재 위치 주변에서 랜덤하게 이동
+                                    # Pick a random point 2-4 m from the agent.
                                     current_pos = getattr(self.agent_memory, "position", None)
                                     if current_pos is not None:
                                         try:
@@ -1920,13 +1835,10 @@ class ViCoPolicy:
                                             if isinstance(agent_arr, np.ndarray) and agent_arr.shape[0] >= 3:
                                                 agent_x = float(agent_arr[0])
                                                 agent_z = float(agent_arr[2])
-                                                # 현재 위치에서 2-4m 떨어진 랜덤 위치 생성
-                                                import random
                                                 angle = random.uniform(0, 2 * math.pi)
                                                 distance = random.uniform(2.0, 4.0)
                                                 random_x = agent_x + distance * math.cos(angle)
                                                 random_z = agent_z + distance * math.sin(angle)
-                                                # Map bounds 체크
                                                 if hasattr(self.agent_memory, "_scene_bounds"):
                                                     bounds = getattr(self.agent_memory, "_scene_bounds", None)
                                                     if bounds:
@@ -1938,7 +1850,6 @@ class ViCoPolicy:
                                                             random_x = max(x_min + 1.0, min(x_max - 1.0, random_x))
                                                         if z_min is not None and z_max is not None:
                                                             random_z = max(z_min + 1.0, min(z_max - 1.0, random_z))
-                                                # Room 체크
                                                 if self.env_api and "check_pos_in_room" in self.env_api:
                                                     try:
                                                         if self.env_api["check_pos_in_room"]((random_x, random_z)):
@@ -1974,18 +1885,17 @@ class ViCoPolicy:
         if plan is None:
             plan = ReasonedPlan("idle", None, None, 0.0, {"reason": "no_plan"})
         
-        # _ensure_plan_target 호출 전 plan 저장 (fallback을 위해)
         original_plan = plan
         plan = self._ensure_plan_target(plan)
         
-        # _ensure_plan_target이 idle을 반환했고, 원래 plan이 explore fallback이었으면 추가 fallback 시도
+        # Exploration produced nothing usable: try the shared object table.
         if plan.action_type == "idle" and original_plan.action_type == "search" and original_plan.meta.get("reason") == "force_pick_none_no_task_targets":
             if self.logger:
                 self.logger.warning(
                     "[Policy] frame=%s explore fallback returned idle after _ensure_plan_target, trying team_symbolic task_target fallback",
                     frame,
                 )
-            # team_symbolic에서 task_target 찾기 (자신에게 할당된 것만)
+            # Only consider targets assigned to this agent.
             target_found = False
             if snapshot and hasattr(snapshot, "team_symbolic") and snapshot.team_symbolic:
                 skip_targets = self.agent_state.get("skip_targets", {"names": set(), "coords": set(), "ids": set()})
@@ -2057,7 +1967,7 @@ class ViCoPolicy:
                             if self.logger:
                                 self.logger.debug("[Policy] failed to create plan from team_symbolic entry: %s", exc)
             
-            # team_symbolic에서도 찾지 못했으면 랜덤 이동 시도
+            # Nothing in shared memory either: move somewhere at random.
             if not target_found:
                 current_pos = getattr(self.agent_memory, "position", None)
                 if current_pos is not None:
@@ -2066,7 +1976,6 @@ class ViCoPolicy:
                         if isinstance(agent_arr, np.ndarray) and agent_arr.shape[0] >= 3:
                             agent_x = float(agent_arr[0])
                             agent_z = float(agent_arr[2])
-                            import random
                             angle = random.uniform(0, 2 * math.pi)
                             distance = random.uniform(2.0, 4.0)
                             random_x = agent_x + distance * math.cos(angle)
@@ -2178,7 +2087,7 @@ class ViCoPolicy:
                                             )
                             plan = ReasonedPlan("idle", None, None, 0.0, {"reason": "target_outside_map_bounds"})
                             rejected = True
-            # 방안 2: (0,0,0) 타겟 문제 해결 + LLM이 z=0.0 위치 제안 시 reject
+            # Reject degenerate targets such as (0, 0, 0) or z = 0.
             if not rejected and plan.target_position is not None and self.env_api and "check_pos_in_room" in self.env_api:
                 # Check if target is (0,0,0) or similar invalid position (X and Z are both near 0)
                 is_invalid_pos = (abs(target_pos[0]) < 0.01 and abs(target_pos[2]) < 0.01) if len(target_pos) >= 3 else False
@@ -2195,7 +2104,6 @@ class ViCoPolicy:
                     plan = ReasonedPlan("idle", None, None, 0.0, {"reason": "invalid_target_position"})
                     rejected = True
                 elif is_z_zero and guidance.source == "llm":
-                    # LLM이 z=0.0 위치를 제안한 경우 reject하고 skip_targets에 추가
                     if self.logger:
                         self.logger.warning(
                             "[Policy] rejecting LLM suggested z=0.0 position: %s (action=%s), adding to skip_targets",
@@ -2233,7 +2141,7 @@ class ViCoPolicy:
                         # Check if clamped position is valid (in room) and not (0,0,0)
                         clamped_is_valid = False
                         if clamped_pos is not None and len(clamped_pos) >= 3:
-                            clamped_x, clamped_y, clamped_z = clamped_pos[0], clamped_pos[1], clamped_pos[2]
+                            clamped_x, clamped_z = clamped_pos[0], clamped_pos[2]
                             # Check if clamped position is (0,0,0) or invalid
                             is_clamped_zero = (abs(clamped_x) < 0.01 and abs(clamped_z) < 0.01)
                             if not is_clamped_zero:
@@ -2282,18 +2190,15 @@ class ViCoPolicy:
             plan.meta["override"] = "near_grabbable"
         self.last_plan = guidance
         
-        # 핵심 수정: continuous movement가 진행 중이면 새로운 navigation 액션 생성 방지
-        # 이전 move_to_position이 완료되기 전에 새로운 move_to_position이 들어오면 이전 액션이 취소되는 문제 해결
-        # 단, prev_status=2 (failure)이거나 너무 오래 지속되면 (20프레임 이상) 새로운 navigation 허용
+        # Do not restart navigation while a continuous move is in flight, since the
+        # new command would cancel the previous one. A failed or long-running move
+        # (20+ frames) is the exception.
         last_command = self.agent_state.get("last_command")
         is_navigation_plan = plan.action_type in ("move", "search")
-        # Pick 액션이지만 거리가 멀어서 navigation으로 변환될 가능성이 있는 경우도 확인
         is_pick_that_might_navigate = plan.action_type == "pick"
         if (is_navigation_plan or is_pick_that_might_navigate) and last_command == "continuous_move" and isinstance(prev_status, int):
-            # prev_status=2 (failure)이거나 너무 오래 지속되면 새로운 navigation 허용
             if prev_status == 2:
-                # 실패했으므로 새로운 navigation 허용
-                # 장애물 감지: 현재 위치를 공유 메모리에 저장 (deliver 액션 포함)
+                # Share the blocking position with the team.
                 if self.team_hub is not None and hasattr(self.agent_memory, "position") and self.agent_memory.position is not None:
                     try:
                         agent_pos = self.agent_memory.position
@@ -2317,12 +2222,9 @@ class ViCoPolicy:
                         frame,
                         plan.action_type,
                     )
-                # Navigation state는 위에서 clear됨
             elif prev_status == 0:
-                # Ongoing인 경우, 너무 오래 지속되면 새로운 navigation 허용
                 last_nav_frame = self.agent_state.get("last_nav_start_frame", -1)
                 if last_nav_frame >= 0 and frame - last_nav_frame >= 20:
-                    # 너무 오래 지속되면 새로운 navigation 허용
                     if self.logger:
                         self.logger.warning(
                             "[Policy] navigation ongoing for %d frames (>=20), allowing new navigation action frame=%s plan_action=%s",
@@ -2330,9 +2232,7 @@ class ViCoPolicy:
                             frame,
                             plan.action_type,
                         )
-                    # Navigation state는 위에서 clear됨
                 else:
-                    # Navigation이 진행 중이면 새로운 navigation 액션 생성하지 않음
                     if self.logger:
                         self.logger.debug(
                             "[Policy] navigation already ongoing (prev_status=0, %d frames), returning ongoing instead of new navigation action frame=%s plan_action=%s",
@@ -2369,7 +2269,6 @@ class ViCoPolicy:
                 
                 # If still idle, try random position
                 if explore_plan.action_type == "idle" and current_pos and invalid_pos_count >= 8:
-                    import random
                     if hasattr(self, 'env_api') and self.env_api:
                         room_bounds = self.env_api.get("room_bounds")
                         if room_bounds:
@@ -2438,11 +2337,9 @@ class ViCoPolicy:
             self.agent_state["last_deliver_id"] = plan.target_id
             self.agent_state["last_deliver_pos"] = plan.target_position
         elif command_type == 9:
-            # type: 9 (continuous movement) - navigation으로 간주
             self.agent_state["last_command"] = "continuous_move"
-            # Navigation 시작 프레임 기록 (ongoing이 너무 오래 지속되는지 확인하기 위해)
+            # Start the timeout clock.
             self.agent_state["last_nav_start_frame"] = frame
-            # Pick을 위한 navigation인 경우 last_pick_id 저장 (task target인 경우만)
             if plan.action_type == "pick" and plan.target_id is not None:
                 if is_task_target_id(plan.target_id, plan_meta, visible_infos, snapshot):
                     self.agent_state["last_pick_id"] = plan.target_id
@@ -2455,7 +2352,8 @@ class ViCoPolicy:
                         )
         elif command_type not in (None, "ongoing"):
             self.agent_state["last_command"] = str(command_type)
-        # If pick action resulted in navigation (too_far_for_pick), store pick_id for retry after navigation (task target인 경우만)
+        # A pick that turned into navigation stores its id so the pick can be
+        # retried on arrival; only task targets are tracked this way.
         if plan.action_type == "pick" and exec_meta.get("reason") == "too_far_for_pick":
             if plan.target_id is not None:
                 if is_task_target_id(plan.target_id, plan_meta, visible_infos, snapshot):
@@ -2477,7 +2375,7 @@ class ViCoPolicy:
             name = plan.meta.get("target_name") if isinstance(plan.meta, dict) else None
             self._register_skip_target(name=name, position=target)
             self.active_target = None
-            # 핵심 수정: Guard에 걸린 위치를 blocked_coords에도 추가하여 spiral search에서 제외
+            # A guard-rejected position is also excluded from the spiral search.
             if target is not None:
                 try:
                     blocked_coords = self.agent_state.get("blocked_coords", set())
@@ -2561,9 +2459,8 @@ class ViCoPolicy:
             }
             position = item.get("position", None)
             location = item.get("location", None)
-            # NOTE: visible_objects from tdw_gym.py only contains id, type, seg_color, name (no position field)
-            # So position will always be None here, and we need to calculate it
-            # Try to get position from multiple sources
+            # visible_objects carries only id, type, seg_color and name, so a
+            # position has to come from memory or be recomputed from depth.
             if position is None and location is None:
                 # First try agent_memory.get_object_position (from stored object_info)
                 if self.agent_memory is not None and hasattr(self.agent_memory, "get_object_position"):
@@ -2585,7 +2482,7 @@ class ViCoPolicy:
                         pass
                 # If still None, try to calculate position using cal_object_position (like COELA does)
                 # Note: agent_memory.update() is already called before policy.act(), so agent_memory.obs is up-to-date
-                # CRITICAL: visible_objects from tdw_gym.py does NOT include position, so we MUST calculate it here
+                # Nothing upstream supplies a position, so compute it here.
                 if position is None:
                     has_seg_color = "seg_color" in item
                     has_obs = hasattr(self.agent_memory, "obs") and self.agent_memory.obs is not None
@@ -2708,6 +2605,7 @@ class ViCoPolicy:
         return {
             "rgb": rgb_tensor,
             "depth": depth,
+            "seg_mask": obs.get("seg_mask"),
             "instruction": obs.get("instruction"),
             "object_names": object_names,
             "object_infos": object_infos,
@@ -2903,7 +2801,6 @@ class ViCoPolicy:
                     )
         
         if put_in_success:
-            # Deliver 성공 시 실패 횟수 초기화
             last_deliver_id = self.agent_state.get("last_deliver_id")
             if last_deliver_id is not None:
                 if "deliver_fail_count" in self.agent_state and last_deliver_id in self.agent_state["deliver_fail_count"]:
@@ -2922,13 +2819,13 @@ class ViCoPolicy:
                 # This removes all delivered objects from holding_ids
                 holding_ids = [hid for hid in actual_held_ids if hid not in previous_holding_ids]
                 
-                # CRITICAL: Add delivered objects to verification_removed_ids to prevent them from being re-added
+                # Delivered objects must not reappear as candidates:
                 # This is necessary because TDW may still show them in held_objects for several frames after delivery
                 verification_removed_set = self.agent_state.get("verification_removed_ids", set())
                 verification_removed_set.update(previous_holding_ids)
                 self.agent_state["verification_removed_ids"] = verification_removed_set
                 
-                # CRITICAL: Add delivered objects to skip_targets to prevent them from being picked up again
+                # skip them by id as well as by verification.
                 # This prevents the policy from trying to pick up objects that have already been delivered
                 # Use object_id instead of name to avoid skipping other objects with the same name
                 # Also track delivery frame and object name for wrong room detection
@@ -3042,7 +2939,6 @@ class ViCoPolicy:
                 self.agent_state["current_room"] = room
 
     def _ensure_plan_target(self, plan: ReasonedPlan) -> ReasonedPlan:
-        import time
         func_start_time = time.time()
         if self.logger:
             self.logger.debug(
@@ -3066,22 +2962,20 @@ class ViCoPolicy:
                     guard_x = key[0] / 10.0
                     guard_z = key[1] / 10.0 if len(key) > 1 else 0.0
                     guard_coords.add((guard_x, guard_z))
-        # 공유된 장애물 좌표 추가 (다른 에이전트가 감지한 장애물 피하기)
-        # 개선: 장애물이 너무 많으면 explore가 실패할 수 있으므로, 최근 장애물만 사용 (최대 10개)
+        # Add the partner's obstacles, but only the ten most recent: blocking too
+        # many cells leaves exploration with nowhere to go.
         shared_obstacle_coords = set()
         obstacle_coords_dict = self.agent_state.get("shared_obstacle_coords", {})
         if obstacle_coords_dict:
-            # obstacle_coords_dict는 {(x, z): detected_frame} 형식
-            # TTL이 지난 장애물은 제외 (120프레임 = 약 4초)
+            # Obstacles expire after 120 frames.
             current_frame = self.agent_state.get("current_frame", 0)
             obstacle_ttl = 120
             valid_obstacles = []
             for coord, detected_frame in obstacle_coords_dict.items():
                 if current_frame - detected_frame < obstacle_ttl:
                     valid_obstacles.append((coord, detected_frame))
-            # 최근 장애물만 사용 (최대 10개) - 너무 많으면 explore가 실패할 수 있음
-            valid_obstacles.sort(key=lambda x: x[1], reverse=True)  # 최신순 정렬
-            for coord, _ in valid_obstacles[:10]:  # 최대 10개만 사용
+            valid_obstacles.sort(key=lambda x: x[1], reverse=True)
+            for coord, _ in valid_obstacles[:10]:
                 shared_obstacle_coords.add(coord)
         blocked_coords = skip_coords | guard_coords | shared_obstacle_coords
 
@@ -3096,10 +2990,9 @@ class ViCoPolicy:
         current_arr = _to_array(current_pos)
         target_arr = _to_array(self.active_target)
         
-        # 개선: target_id가 있지만 target_position이 없으면 agent_memory에서 위치 조회
+        # Resolve a target id without a position against local memory.
         if plan.target_id is not None and plan.target_position is None and self.agent_memory is not None:
             try:
-                # agent_memory에서 객체 위치 가져오기
                 if hasattr(self.agent_memory, "get_object_position"):
                     obj_pos = self.agent_memory.get_object_position(plan.target_id)
                     if obj_pos is not None:
@@ -3117,7 +3010,6 @@ class ViCoPolicy:
                                     plan.target_id,
                                     plan.target_position,
                                 )
-                # get_object_position이 없으면 object_info에서 조회
                 elif hasattr(self.agent_memory, "object_info") and plan.target_id in self.agent_memory.object_info:
                     obj_info = self.agent_memory.object_info[plan.target_id]
                     obj_pos = obj_info.get("position")
@@ -3202,11 +3094,9 @@ class ViCoPolicy:
         if self.agent_memory is None:
             return plan
         
-        # 핵심 수정: 이미 target_position이 있는 move plan에 대해서는 explore를 다시 호출하지 않음
-        # (이미 한 번 explore를 통해 위치를 찾았는데, 또 다시 호출하면 같은 위치를 반환할 수 있음)
-        # 단, Guard에 걸린 위치는 blocked_coords에 추가되므로, blocked되었으면 새로운 위치를 찾아야 함
+        # A move plan that already has an unblocked position keeps it; calling
+        # explore again would likely return the same cell.
         if plan.action_type == "move" and plan.target_position is not None:
-            # target_position이 이미 있고, blocked되지 않았으면 그대로 사용
             is_blocked = self._is_blocked_position(plan.target_position, blocked_coords)
             if not is_blocked:
                 if self.logger:
@@ -3218,7 +3108,7 @@ class ViCoPolicy:
                 self.target_acquire_frame = self.agent_state.get("frame", -999)
                 return plan
             else:
-                # blocked되었으면 search plan으로 변경하여 새로운 위치 찾기
+                # Blocked: fall back to a search plan.
                 if self.logger:
                     self.logger.warning(
                         "[Policy] _ensure_plan_target: move plan target_position=%s is blocked (in blocked_coords), redirecting to search for new position",
@@ -3228,17 +3118,15 @@ class ViCoPolicy:
                 meta["fallback"] = "explore"
                 meta["reason"] = f"redirect_from_blocked:{meta.get('target_name')}"
                 plan = ReasonedPlan("search", None, None, max(plan.confidence * 0.5, 0.2), meta)
-        # 방안 2: explore() 재시도 로직 개선
-        # 핵심 수정: explore() 호출을 완전히 우회하고, 더 간단하고 안전한 fallback 로직 사용
-        # explore() 함수는 known_map이 비어있거나 find_shortest_path가 오래 걸릴 수 있어 위험함
-        # 특히 known_map == 0인 위치가 없으면 random.randint(0, -1)로 ValueError 발생 가능
+        # explore() is only safe once the map has unexplored cells; with an empty
+        # known_map it raises, and A* can take arbitrarily long.
         explore_x, explore_z = None, None
         try:
             import time
             start_time = time.time()
-            max_total_time = 0.5  # 최대 0.5초 (매우 짧게)
+            max_total_time = 0.5
             
-            # 핵심: explore() 호출 전에 known_map 체크하여 위험한 경우 완전히 우회
+            # Check the map first and skip exploration when it would be unsafe.
             should_skip_explore = False
             if hasattr(self.agent_memory, "known_map") and self.agent_memory.known_map is not None:
                 known_map_zeros = np.where(self.agent_memory.known_map == 0)
@@ -3255,18 +3143,11 @@ class ViCoPolicy:
                     )
                 should_skip_explore = True
             
-            # 핵심 수정: explore() 호출을 완전히 우회하고, 더 간단한 fallback 사용
-            # explore() 함수는 내부적으로 무한 루프에 빠질 수 있어 매우 위험함
-            # 대신 현재 위치 주변의 간단한 위치를 생성하거나, team_symbolic에서 task_target을 찾음
             if not should_skip_explore:
-                # FIX(2026-06-20): 실제 프론티어 탐색 explore()를 호출.
-                # 이전 코드는 여기서 explore_x/z를 무조건 None으로 두어 explore()가
-                # 한 번도 호출되지 않았고, 에이전트가 랜덤 워크만 하다 task object를
-                # 끝내 못 찾아 Transport Rate=0이 됐다. should_skip_explore=False이면
-                # known_map에 미탐색(0) 셀이 보장되므로 explore() 내부의
-                # random.randint(0, -1) ValueError는 발생하지 않는다.
-                # explore()의 예외/지연은 바깥 try/except + 이후 spiral-search
-                # fallback이 흡수하므로 안전하다.
+                # should_skip_explore is False, so the map is guaranteed to contain
+                # unexplored cells and explore() will not raise. Any other failure or
+                # delay is absorbed by the surrounding try/except and the spiral-search
+                # fallback below.
                 try:
                     explore_x, explore_z = self.agent_memory.explore(random_prob=0.1)
                     if self.logger:
@@ -3283,7 +3164,7 @@ class ViCoPolicy:
                         )
                     explore_x, explore_z = None, None
             
-            # explore() 호출 후 위치 검증 (while 루프 밖에서)
+            # Validate whatever explore() returned.
             if explore_x is not None and explore_z is not None:
                 candidate_pos = (float(explore_x), 0.0, float(explore_z))
                 # Check if position is (0,0,0) or invalid
@@ -3295,7 +3176,7 @@ class ViCoPolicy:
                         is_valid = self.env_api["check_pos_in_room"]((candidate_pos[0], candidate_pos[2]))
                     except Exception:
                         is_valid = False
-                # Also check map bounds (LLM처럼 1.0m 마진을 두고 체크)
+                # Also check map bounds, with a 1 m margin.
                 if is_valid and hasattr(self.agent_memory, "_scene_bounds"):
                     bounds = getattr(self.agent_memory, "_scene_bounds", None)
                     if bounds:
@@ -3303,18 +3184,17 @@ class ViCoPolicy:
                         x_max = bounds.get("x_max")
                         z_min = bounds.get("z_min")
                         z_max = bounds.get("z_max")
-                        margin = 1.0  # LLM과 동일한 마진 사용
+                        margin = 1.0
                         if (x_min is not None and x_max is not None and (explore_x < x_min + margin or explore_x > x_max - margin)) or \
                            (z_min is not None and z_max is not None and (explore_z < z_min + margin or explore_z > z_max - margin)):
                             is_valid = False
                 # Check if position is blocked (including guard_skip positions and shared obstacles)
                 is_blocked = self._is_blocked_position(candidate_pos, blocked_coords)
-                # 추가 체크: 공유된 장애물 좌표와의 거리 확인
                 if not is_blocked and shared_obstacle_coords and len(shared_obstacle_coords) <= 5:
                     candidate_x, candidate_z = candidate_pos[0], candidate_pos[2]
                     for obs_x, obs_z in shared_obstacle_coords:
                         dist_to_obstacle = math.sqrt((candidate_x - obs_x) ** 2 + (candidate_z - obs_z) ** 2)
-                        if dist_to_obstacle < 0.5:  # 0.5m 이내면 장애물로 간주
+                        if dist_to_obstacle < 0.5:  # Within 0.5 m of a known obstacle.
                             is_blocked = True
                             if self.logger:
                                 self.logger.debug(
@@ -3326,7 +3206,7 @@ class ViCoPolicy:
                                     dist_to_obstacle,
                                 )
                             break
-                # 같은 위치로 반복 이동 방지
+                # Avoid revisiting a recent explore target.
                 last_explore_positions = self.agent_state.get("last_explore_positions", [])
                 is_duplicate = False
                 if last_explore_positions:
@@ -3337,7 +3217,6 @@ class ViCoPolicy:
                             if dist_to_last < 0.5:
                                 is_duplicate = True
                                 break
-                # 유효하지 않은 위치면 None으로 설정
                 if is_zero_pos or is_blocked or not is_valid or is_duplicate:
                     if self.logger:
                         self.logger.debug(
@@ -3348,7 +3227,6 @@ class ViCoPolicy:
                             is_duplicate,
                         )
                     explore_x, explore_z = None, None
-            # 타임아웃 체크 및 로깅
             elapsed_time = time.time() - start_time
             if self.logger:
                 if elapsed_time > max_total_time:
@@ -3369,14 +3247,13 @@ class ViCoPolicy:
                     exc,
                     exc_info=True,
                 )
-            # 예외 발생 시 idle plan 반환하여 fallback 로직으로 넘어가도록 함
+            # Return idle so the fallback below takes over.
             return ReasonedPlan("idle", None, None, 0.0, {"reason": "explore_exception", "error": str(exc)})
         
-        # 개선: 유효한 explore 위치를 찾았으면 last_explore_positions에 추가
+        # Remember the last ten explore targets.
         if explore_x is not None and explore_z is not None and not (abs(explore_x) < 0.01 and abs(explore_z) < 0.01):
             last_explore_positions = self.agent_state.get("last_explore_positions", [])
             last_explore_positions.append((explore_x, explore_z))
-            # 최근 10개만 유지
             if len(last_explore_positions) > 10:
                 last_explore_positions = last_explore_positions[-10:]
             self.agent_state["last_explore_positions"] = last_explore_positions
@@ -3387,31 +3264,28 @@ class ViCoPolicy:
             if current_arr is not None and current_arr.shape[0] >= 3:
                 agent_x = float(current_arr[0])
                 agent_z = float(current_arr[2])
-                # 핵심 수정: blocked_coords를 가져와서 spiral search에서 제외
-                # Guard에 걸린 위치나 skip된 위치를 피하기 위해
+                # Exclude blocked positions, the current position and recent explore
+                # targets, so the search actually moves the agent somewhere new.
                 blocked_coords_for_search = blocked_coords.copy() if blocked_coords else set()
-                # 현재 위치도 제외 (같은 위치로 이동하지 않도록)
                 blocked_coords_for_search.add((agent_x, agent_z))
-                # last_explore_positions도 제외 (최근에 시도한 위치 피하기)
                 last_explore_positions = self.agent_state.get("last_explore_positions", [])
-                for last_pos in last_explore_positions[-10:]:  # 최근 10개 위치 제외
+                for last_pos in last_explore_positions[-10:]:
                     if last_pos is not None and len(last_pos) >= 2:
                         last_x = float(last_pos[0])
                         last_z = float(last_pos[1] if len(last_pos) > 1 else 0.0)
                         blocked_coords_for_search.add((last_x, last_z))
                 
-                # 핵심 수정: 랜덤 시작 각도 사용하여 매번 다른 위치를 찾도록 함
-                import random
-                start_angle = random.uniform(0, 360)  # 랜덤 시작 각도
-                angles = [start_angle + i * 45 for i in range(8)]  # 8개 방향
-                angles = [a % 360 for a in angles]  # 0-360 범위로 정규화
+                # A random starting angle keeps successive searches from repeating.
+                start_angle = random.uniform(0, 360)
+                angles = [start_angle + i * 45 for i in range(8)]
+                angles = [a % 360 for a in angles]
                 
                 # Try positions around agent's current position (spiral search)
                 search_radius = 1.0
                 max_radius = 5.0
                 found_valid = False
                 while search_radius <= max_radius and not found_valid:
-                    # Try 8 directions around agent position (랜덤 시작 각도 사용)
+                    # Try 8 directions around the agent.
                     for angle in angles:
                         rad = math.radians(angle)
                         test_x = agent_x + search_radius * math.cos(rad)
@@ -3425,7 +3299,7 @@ class ViCoPolicy:
                                 x_max = bounds.get("x_max")
                                 z_min = bounds.get("z_min")
                                 z_max = bounds.get("z_max")
-                                margin = 1.0  # LLM과 동일한 마진 사용
+                                margin = 1.0
                                 if (x_min is not None and x_max is not None and (test_x < x_min + margin or test_x > x_max - margin)) or \
                                    (z_min is not None and z_max is not None and (test_z < z_min + margin or test_z > z_max - margin)):
                                     is_valid = False
@@ -3435,7 +3309,6 @@ class ViCoPolicy:
                                 is_valid = self.env_api["check_pos_in_room"]((test_x, test_z))
                             except Exception:
                                 is_valid = False
-                        # Check if blocked (blocked_coords_for_search 사용)
                         is_blocked = self._is_blocked_position((test_x, 0.0, test_z), blocked_coords_for_search)
                         if is_valid and not is_blocked:
                             explore_x, explore_z = test_x, test_z
@@ -3456,20 +3329,19 @@ class ViCoPolicy:
                 
                 # If still not found, try to find a position that's at least 2m away from current position
                 if not found_valid:
-                    # 핵심 수정: 현재 위치를 fallback으로 사용하지 않고, 최소 2m 이상 떨어진 위치를 찾음
-                    # 현재 위치로 이동하면 path_len=1이 되어 같은 위치에서 머물게 됨
-                    min_distance = 2.0  # 최소 2m 이상 떨어진 위치만 사용
+                    # Falling back to the current position yields a path of length 1 and the
+                    # agent never moves, so require at least 2 m of displacement.
+                    min_distance = 2.0
                     search_radius = min_distance
-                    max_radius = 8.0  # 최대 8m까지 탐색
+                    max_radius = 8.0
                     found_valid = False
-                    # 핵심 수정: 랜덤 시작 각도 사용하여 매번 다른 위치를 찾도록 함
-                    import random
-                    start_angle_16 = random.uniform(0, 360)  # 랜덤 시작 각도
-                    angles_16 = [start_angle_16 + i * 22.5 for i in range(16)]  # 16개 방향
-                    angles_16 = [a % 360 for a in angles_16]  # 0-360 범위로 정규화
+                    # A random starting angle keeps successive searches from repeating.
+                    start_angle_16 = random.uniform(0, 360)
+                    angles_16 = [start_angle_16 + i * 22.5 for i in range(16)]
+                    angles_16 = [a % 360 for a in angles_16]
                     
                     while search_radius <= max_radius and not found_valid:
-                        # Try 16 directions around agent position (랜덤 시작 각도 사용)
+                        # Try 16 directions around the agent.
                         for angle in angles_16:
                             rad = math.radians(angle)
                             test_x = agent_x + search_radius * math.cos(rad)
@@ -3493,7 +3365,6 @@ class ViCoPolicy:
                                     is_valid = self.env_api["check_pos_in_room"]((test_x, test_z))
                                 except Exception:
                                     is_valid = False
-                            # Check if blocked (blocked_coords_for_search 사용)
                             is_blocked = self._is_blocked_position((test_x, 0.0, test_z), blocked_coords_for_search)
                             if is_valid and not is_blocked:
                                 explore_x, explore_z = test_x, test_z
@@ -3509,9 +3380,9 @@ class ViCoPolicy:
                                 break
                         if found_valid:
                             break
-                        search_radius += 0.5  # 0.5m씩 증가
+                        search_radius += 0.5
                     
-                    # 여전히 찾지 못했으면 idle 반환 (현재 위치를 fallback으로 사용하지 않음)
+                    # Nothing valid found: stay idle rather than target the current position.
                     if not found_valid:
                         if self.logger:
                             self.logger.warning(
@@ -3525,7 +3396,7 @@ class ViCoPolicy:
                     base_pos = (0.0, 0.0, 0.0)
                     clamped = self.executor._clamp_target(base_pos)
                     if clamped is not None and len(clamped) >= 3:
-                        clamped_x, clamped_y, clamped_z = clamped[0], clamped[1], clamped[2]
+                        clamped_x, clamped_z = clamped[0], clamped[2]
                         if abs(clamped_x) < 0.01 and abs(clamped_z) < 0.01:
                             if self.logger:
                                 self.logger.warning(
@@ -3555,32 +3426,28 @@ class ViCoPolicy:
         height = float(pos_arr[1]) if pos_arr is not None and pos_arr.shape[0] >= 2 else 0.0
         target_pos: Tuple[float, float, float] = (float(explore_x), height, float(explore_z))
         
-        # 핵심 수정: 목표 위치가 현재 위치와 너무 가까우면 (1m 이내) 더 먼 위치로 조정
+        # Push a target that is within 1 m of the agent out to at least 2 m,
         if current_arr is not None and current_arr.shape[0] >= 3:
             current_x = float(current_arr[0])
             current_z = float(current_arr[2])
             target_x = float(explore_x)
             target_z = float(explore_z)
             distance_to_target = math.sqrt((target_x - current_x) ** 2 + (target_z - current_z) ** 2)
-            min_distance = 2.0  # 최소 2m 이상 떨어진 위치만 사용
+            min_distance = 2.0
             
             if distance_to_target < min_distance:
-                # 목표 위치가 너무 가까우면, 현재 위치에서 최소 거리만큼 떨어진 위치로 조정
+                # otherwise the move completes without going anywhere.
                 if distance_to_target < 0.01:
-                    # 거의 같은 위치면 랜덤 방향으로 이동
-                    import random
+                    # Coincident positions get a random direction.
                     angle = random.uniform(0, 2 * math.pi)
                 else:
-                    # 현재 방향으로 최소 거리만큼 이동
                     dx = target_x - current_x
                     dz = target_z - current_z
                     angle = math.atan2(dz, dx)
                 
-                # 최소 거리만큼 떨어진 위치 계산
                 adjusted_x = current_x + min_distance * math.cos(angle)
                 adjusted_z = current_z + min_distance * math.sin(angle)
                 
-                # 조정된 위치가 유효한지 확인
                 is_valid = True
                 if hasattr(self.agent_memory, "_scene_bounds"):
                     bounds = getattr(self.agent_memory, "_scene_bounds", None)
@@ -3613,7 +3480,6 @@ class ViCoPolicy:
                             min_distance,
                         )
                 else:
-                    # 조정된 위치가 유효하지 않으면 idle 반환
                     if self.logger:
                         self.logger.warning(
                             "[Policy] _ensure_plan_target: target position too close (%.2fm) and adjusted position invalid, returning idle",
@@ -3629,7 +3495,7 @@ class ViCoPolicy:
                     if hasattr(self.executor, "_clamp_target"):
                         clamped = self.executor._clamp_target(target_pos)
                         if clamped is not None and len(clamped) >= 3:
-                            clamped_x, clamped_y, clamped_z = clamped[0], clamped[1], clamped[2]
+                            clamped_x, clamped_z = clamped[0], clamped[2]
                             # Check if clamped position is still (0,0,0) or invalid
                             if abs(clamped_x) < 0.01 and abs(clamped_z) < 0.01:
                                 # Clamped to (0,0,0) - this is invalid, return idle instead
@@ -3669,6 +3535,40 @@ class ViCoPolicy:
         return ReasonedPlan(action_type="move", target_id=None, target_position=target_pos, confidence=max(plan.confidence, 0.3), meta=meta)
 
     # ------------------------------------------------------------------
+    def _apply_relevance_scores(self, object_infos: List[Dict[str, Any]], snapshot: Any) -> None:
+        """Copy the shared visual-language relevance score onto the visible objects.
+
+        The score is produced by the perception pipeline and stored per object
+        in the team memory; the candidate scorer reads it from here.
+        """
+        relevance: Dict[Any, float] = {}
+        for entry in getattr(snapshot, "team_symbolic", []) or []:
+            object_id = entry.get("id")
+            score = entry.get("score")
+            if object_id is not None and score is not None:
+                relevance[object_id] = float(score)
+        for info in object_infos:
+            score = relevance.get(info.get("id"))
+            if score is not None:
+                info["score"] = score
+
+    def _candidate_score(self, distance: Optional[float], relevance: Optional[float]) -> float:
+        """s(a) = w_d / (d + eps) + (w_n + w_v) * c, as used to rank candidates."""
+        weights = self.cfg.reasoner_heuristic_weights
+        try:
+            d = max(float(distance), 0.0)
+        except (TypeError, ValueError):
+            d = 1.0
+        score = weights.get("distance", 1.5) / (d + 1e-3)
+        if self.cfg.heuristic_scoring:
+            try:
+                c = float(relevance)
+            except (TypeError, ValueError):
+                c = DEFAULT_RELEVANCE
+            score += (weights.get("novelty", 0.8) + weights.get("visibility", 0.6)) * c
+        return score
+
+    # ------------------------------------------------------------------
     def _register_skip_target(self, name: Optional[str] = None, position: Optional[Tuple[float, float, float]] = None, object_id: Optional[int] = None) -> None:
         store = self.agent_state.setdefault("skip_targets", {"names": set(), "coords": set(), "ids": set()})
         names_set = store.setdefault("names", set())
@@ -3685,7 +3585,7 @@ class ViCoPolicy:
         store["ids"] = ids_set
         self.agent_state["skip_targets"] = store
         if self.team_hub is not None:
-            self.team_hub.update_skip_targets(self.agent_id, names_set, coords_set)
+            self.team_hub.update_skip_targets(self.agent_id, names_set, coords_set, ids_set)
 
     def _skip_coords(self) -> set:
         store = self.agent_state.get("skip_targets", {})
@@ -3807,30 +3707,27 @@ class ViCoPolicy:
             if obj_id in holding_ids:
                 filtered_reasons["already_held"] = filtered_reasons.get("already_held", 0) + 1
                 continue
-            # 방법 3: 이전 위치 정보 활용 - agent_memory에 이전 위치 저장 및 활용
-            # visible_infos의 위치를 우선 사용 (가장 정확)
-            # agent_memory의 위치는 잘못 계산될 수 있으므로 신뢰하지 않음
+            # Positions from visible_infos are the most reliable; anything from
+            # agent_memory is only used when nothing better exists, and is validated
+            # before use.
             position = self._normalise_position(info.get("position"))
-            position_confidence = 1.0  # 기본 신뢰도
+            position_confidence = 1.0
             if position is None:
                 position = self._normalise_position(info.get("location"))
-            # visible_infos에서 가져온 위치가 없을 때만 agent_memory에서 가져옴
-            # 하지만 이 위치는 신뢰하지 않고 검증만 함
             if position is None:
                 # Try to get position from agent_memory (last resort, but validate carefully)
                 obj_id = info.get("id")
                 if obj_id is not None and self.agent_memory is not None:
-                    # 방법 3: 이전 위치 정보 활용 (last_known_position)
                     if hasattr(self.agent_memory, "object_info") and obj_id in getattr(self.agent_memory, "object_info", {}):
                         try:
                             obj_info = self.agent_memory.object_info[obj_id]
-                            # last_known_position 우선 사용 (캐시된 위치)
+                            # Prefer the cached position.
                             last_known_pos = obj_info.get("last_known_position")
                             last_seen_frame = obj_info.get("last_seen_frame", 0)
                             current_frame = self.agent_state.get("frame", 0)
                             if last_known_pos is not None and current_frame - last_seen_frame < 100:
                                 position = self._normalise_position(last_known_pos)
-                                position_confidence = 0.5  # 캐시된 위치는 낮은 신뢰도
+                                position_confidence = 0.5
                                 if self.logger:
                                     self.logger.debug(
                                         "[Policy] _maybe_force_pick: using cached position for id=%s (age=%d frames, confidence=%.2f)",
@@ -3841,7 +3738,6 @@ class ViCoPolicy:
                         except Exception:
                             pass
                     
-                    # last_known_position이 없으면 일반 position 사용
                     if position is None and hasattr(self.agent_memory, "get_object_position"):
                         try:
                             mem_pos = self.agent_memory.get_object_position(obj_id)
@@ -3900,17 +3796,15 @@ class ViCoPolicy:
                                         obj_name = obj_info.get("name")
                                         if obj_name:
                                             skip_names.add(str(obj_name).lower())
-                                            # 방안 3: skip_targets에 추가하여 재시도 방지
+                                            # Skip it so it is not retried.
                                             self._register_skip_target(name=str(obj_name).lower())
                                         continue
                         except Exception:
                             pass
 
-            # FIX(2026-06-20): 캐시에 위치가 없으면 현재 프레임 depth+seg로 직접 재계산.
-            # team_symbolic 경유 task target은 position이 None으로 초기화되고(위 ~1738행)
-            # "will be recalculated in _maybe_force_pick"라는 주석과 달리 여태 재계산이
-            # 없어서 보이는 음식조차 no_position으로 탈락 → 집기 0 → TR 0이었다.
-            # _prepare_perception_inputs와 동일하게 cal_object_position을 호출한다.
+            # Task targets that arrive through shared memory carry no position, so
+            # recompute it here from this frame's depth and segmentation, exactly as
+            # _prepare_perception_inputs does.
             if position is None and info.get("seg_color") is not None \
                and self.agent_memory is not None \
                and hasattr(self.agent_memory, "cal_object_position") \
@@ -3929,17 +3823,12 @@ class ViCoPolicy:
                 except Exception:
                     pass
 
-            # 방안 3: 최종 위치 검증
-            # COELA는 map bounds 밖의 객체를 object_info에 저장하지 않지만,
-            # cal_object_position이 잘못된 위치를 계산할 수 있으므로 모든 위치를 검증해야 함
-            # visible_infos의 위치도 cal_object_position으로 계산되므로 검증 필요
-            position_from_visible = (info.get("position") is not None or info.get("location") is not None) and position is not None
+            # Validate every position against the map bounds: positions from
+            # visible_infos also come from cal_object_position and can land outside
+            # the room.
             if position is not None:
                 x, y, z = position
                 is_valid_pos = True
-                # 모든 위치를 map bounds로 검증 (visible_infos도 cal_object_position으로 계산되므로)
-                # COELA 방식: map bounds 밖의 객체는 사용하지 않음
-                # Check map bounds for ALL positions (visible_infos도 검증 필요)
                 if hasattr(self.agent_memory, "_scene_bounds"):
                     bounds = getattr(self.agent_memory, "_scene_bounds", None)
                     if bounds:
@@ -3947,7 +3836,7 @@ class ViCoPolicy:
                         x_max = bounds.get("x_max")
                         z_min = bounds.get("z_min")
                         z_max = bounds.get("z_max")
-                        # LLM처럼 1.0m 마진을 두고 체크 (더 보수적으로)
+                        # Keep a 1 m margin from the walls.
                         margin = 1.0
                         if (x_min is not None and x_max is not None and (x < x_min + margin or x > x_max - margin)) or \
                            (z_min is not None and z_max is not None and (z < z_min + margin or z > z_max - margin)):
@@ -4030,23 +3919,20 @@ class ViCoPolicy:
                                 info.get("name"),
                                 exc,
                             )
-            # 방법 1: Depth 기반 거리 추정 활용 강화 - 위치 없어도 depth 기반 거리로 pick 시도
-            # 핵심 수정: position이 None이지만 depth 기반 거리 추정이 있으면 허용
-            # 10m 제한으로 인해 위치 계산이 실패하지만, depth로 거리는 알 수 있는 경우
+            # No position, but depth still gives a range: that is enough to attempt a
+            # pick through reach_for, or to navigate closer first.
             if position is None:
-                # 방법 1: depth 기반 거리 추정이 있으면 pick 시도 (reach_for 사용)
                 estimated_distance = info.get("distance")
                 if estimated_distance is not None:
-                    # Task target이거나 grabbable 객체면 허용
                     is_task_target = info.get("is_task_target", False)
                     is_grabbable = info.get("is_grabbable", False)
                     
-                    # 거리 제한: 20m 이내면 시도 (reach_for는 자동으로 navigation 수행)
+                    # reach_for navigates by itself, so allow it up to 20 m.
                     max_distance_for_reach_for = 20.0
                     if (is_task_target or is_grabbable) and estimated_distance <= max_distance_for_reach_for:
                         # Allow it - we have distance estimate from depth, executor will use reach_for (object_id only)
                         info["position_estimated"] = True
-                        info["use_reach_for"] = True  # reach_for 사용 플래그
+                        info["use_reach_for"] = True
                         if self.logger:
                             self.logger.info(
                                 "[Policy] _maybe_force_pick: allowing %s id=%s name=%s without position (distance=%.2f from depth, will use reach_for)",
@@ -4056,7 +3942,7 @@ class ViCoPolicy:
                                 estimated_distance,
                             )
                     elif is_task_target and estimated_distance > max_distance_for_reach_for:
-                        # Task target이지만 거리가 너무 멀면 navigation 후 pick 시도
+                        # Too far for reach_for: navigate first.
                         info["position_estimated"] = True
                         info["needs_navigation"] = True
                         if self.logger:
@@ -4067,22 +3953,15 @@ class ViCoPolicy:
                                 estimated_distance,
                                 max_distance_for_reach_for,
                             )
-                        # needs_navigation이 설정되었으면 continue하지 않고 계속 진행 (candidates에 추가)
                     else:
-                        # grabbable이지만 task target이 아니고 거리가 20m 초과면 필터링
                         filtered_reasons["no_position"] = filtered_reasons.get("no_position", 0) + 1
                         continue
                 else:
-                    # estimated_distance가 None이면 필터링
                     filtered_reasons["no_position"] = filtered_reasons.get("no_position", 0) + 1
                     continue
             else:
-                # FIX(2026-06-21): position이 있으면 그대로 아래 distance/blocked/append
-                # 로직으로 진행한다. 기존 코드는 이 else(=position이 None이 아닌 경우)에서
-                # needs_navigation 플래그가 없으면 no_position으로 '잘못' 필터링했다.
-                # 그 결과 유효 위치를 가진 모든 task target(음식)이 후보에서 탈락 →
-                # _maybe_force_pick이 항상 None → 집기 0 → Transport Rate 0의 진짜 원인.
-                # (게이트 위 `if position is None:` 분기가 이미 position-없음 경우를 처리함.)
+                # A position is present, so fall through to the distance and blocked
+                # checks below. The branch above already handled the missing-position case.
                 pass
             if info.get("distance") is None:
                 filtered_reasons["no_distance"] = filtered_reasons.get("no_distance", 0) + 1
@@ -4108,7 +3987,7 @@ class ViCoPolicy:
                 filtered_reasons["blocked"] = filtered_reasons.get("blocked", 0) + 1
                 continue
             # Check skip_ids first (more specific - only skips the exact object that was delivered)
-            # 개선: task target은 skip_ids 체크를 건너뛰기 (같은 이름의 다른 객체를 pick해야 할 수 있음)
+            # Task targets bypass the skip list: another object of the same name may still be needed.
             is_task_target = info.get("is_task_target", False)
             if obj_id is not None and obj_id in skip_ids and not is_task_target:
                 filtered_reasons["skip_id"] = filtered_reasons.get("skip_id", 0) + 1
@@ -4116,22 +3995,16 @@ class ViCoPolicy:
             # Check skip_names (less specific - skips all objects with the same name)
             # BUT: Skip this check for task targets - we may need to pick other objects with the same name
             # Only skip by name if it's NOT a task target (task targets are allowed even if same name was delivered before)
-            # is_task_target은 위에서 이미 선언됨
             if not is_task_target:
                 name_lc = str(info.get("name", "")).lower()
                 if name_lc in skip_names:
                     filtered_reasons["skip_name"] = filtered_reasons.get("skip_name", 0) + 1
                     continue
-            # Note: Task target assignment is already done in act() - only objects assigned to this agent are passed in
-            priority = info.get("priority", 0.0)
-            if info.get("is_task_target"):
-                priority += 4.0
-            # For task targets, prioritize heavily - use priority * 2 to ensure they're always chosen over non-task targets
-            # For non-task targets, use normal scoring
-            if info.get("is_task_target"):
-                score = priority * 2.0 - distance * 0.5  # Reduce distance penalty for task targets
-            else:
-                score = priority - distance
+            # Task target assignment already happened in act(); only objects
+            # assigned to this agent reach here.
+            score = self._candidate_score(distance, info.get("score"))
+            if is_task_target:
+                score += TASK_TARGET_BONUS
             candidates.append((score, info))
         if not candidates:
             if self.logger and filtered_reasons:
@@ -4146,8 +4019,7 @@ class ViCoPolicy:
         target_pos = self._normalise_position(best_info.get("position"))
         if target_id is None:
             return None
-        # 핵심 수정: task target이 아닌 객체는 pick하지 않음
-        # task는 특정 객체만 pick해야 하므로, task target이 아닌 객체는 무시
+        # Only task targets are ever picked up.
         if not best_info.get("is_task_target", False):
             if self.logger:
                 self.logger.debug(
@@ -4156,8 +4028,7 @@ class ViCoPolicy:
                     best_info.get("name"),
                 )
             return None
-        # 방법 1: Depth 기반 거리 추정 활용 강화 - 위치 없어도 depth 기반 거리로 pick 시도
-        # 핵심 수정: position이 None이지만 distance가 있으면 위치 추정 또는 object_id만으로 pick 시도
+        # No position, but depth still gives a range: that is enough to attempt a
         use_reach_for = best_info.get("use_reach_for", False)
         needs_navigation = best_info.get("needs_navigation", False)
         
@@ -4166,7 +4037,7 @@ class ViCoPolicy:
             is_task_target = best_info.get("is_task_target", False)
             position_estimated = best_info.get("position_estimated", False)
             
-            # 방법 1: use_reach_for 플래그가 있으면 바로 reach_for 사용
+            # An explicit reach_for request needs no position.
             if use_reach_for:
                 if self.logger:
                     self.logger.info(
@@ -4190,7 +4061,7 @@ class ViCoPolicy:
                     },
                 )
             
-            # 방법 1: needs_navigation 플래그가 있으면 navigation 후 pick
+            # Otherwise navigate first, estimating a position from depth and heading.
             if needs_navigation:
                 if self.logger:
                     self.logger.info(
@@ -4199,8 +4070,6 @@ class ViCoPolicy:
                         best_info.get("name"),
                         distance,
                     )
-                # Navigation을 위한 대략적인 위치 추정 (depth 기반)
-                # Agent의 forward 방향으로 distance만큼 이동한 위치 추정
                 estimated_pos = None
                 if distance is not None and agent_pos is not None:
                     # Try to estimate position first (preferred for task targets)
@@ -4261,7 +4130,6 @@ class ViCoPolicy:
                                     exc,
                                 )
                 
-                # needs_navigation이면 navigation plan 반환 (위치 추정 성공 시)
                 if target_pos is not None:
                     return ReasonedPlan(
                         action_type="move",
@@ -4299,7 +4167,7 @@ class ViCoPolicy:
                                     distance,
                                 )
                         # Keep target_pos as None, executor will handle it
-                        # needs_navigation이면 reach_for 사용 (fallback)
+                        # Position estimation failed: fall back to reach_for.
                         if needs_navigation:
                             return ReasonedPlan(
                                 action_type="pick",
@@ -4324,11 +4192,10 @@ class ViCoPolicy:
                             )
                         return None
             else:
-                # target_pos is None이고 needs_navigation도 False인 경우
-                # 하지만 task target이고 distance가 있으면 허용해야 함
+                # No position and no navigation request, but a task target with a known
+                # distance is still actionable through reach_for.
                 distance = best_info.get("distance")
                 is_task_target = best_info.get("is_task_target", False)
-                # 개선: task target이면 distance가 없어도 허용 (executor가 reach_for 사용)
                 if is_task_target:
                     if self.logger:
                         self.logger.info(
@@ -4374,7 +4241,7 @@ class ViCoPolicy:
             "reason": "policy_override_grabbable",
             "target_name": best_info.get("name"),
             "distance": best_info.get("distance"),
-            "is_task_target": best_info.get("is_task_target", False),  # Executor에서 사용
+            "is_task_target": best_info.get("is_task_target", False),
         }
         confidence = 0.95 if best_info.get("is_task_target") else 0.85
         if self.logger:
@@ -4620,8 +4487,8 @@ class ViCoPolicy:
                                         distance,
                                         max_distance,
                                     )
-                # 핵심 수정: goal_position_id가 있으면 항상 container_candidates에 추가 (최우선)
-                # goal_position_id가 memory에 없어도 env_api에서 위치를 가져올 수 있음
+                # The goal position always wins, even when it is missing from memory:
+                # its position can be read from env_api.
                 if goal_position_id is not None:
                     # Check if goal_position_id is already in container_candidates
                     goal_in_candidates = any(cid == goal_position_id for _, cid, _, _ in container_candidates)
@@ -4722,8 +4589,7 @@ class ViCoPolicy:
                     # Sort by distance (negative distance = goal_position_id = highest priority)
                     container_candidates.sort(key=lambda x: x[0])
                     
-                    # 핵심 수정: goal_position_id가 있으면 항상 최우선 선택 (거리 무관)
-                    # Sort 후에도 goal_position_id가 첫 번째가 아닐 수 있으므로 명시적으로 체크
+                    # Sorting by distance can bury the goal position, so select it explicitly.
                     best_distance, best_id, best_pos, best_name = container_candidates[0]
                     
                     # If goal_position_id exists and is in candidates, always select it first (regardless of distance)

@@ -3,10 +3,8 @@ import os
 import json
 import gym
 import time
-import pickle
 import logging
 import sys
-from typing import Optional
 
 # add this dictionary to python env path:
 base_path = os.getcwd()
@@ -16,7 +14,7 @@ from h_agent import H_agent
 from lm_agent import lm_agent
 from vico_agent import ViCoAgent
 from vico_lite.config import ViCoConfig
-from vico_lite.memory_bridge import TeamMemoryHub
+from vico_lite.memory import TeamMemoryHub
 
 gym.envs.registration.register(
     id='transport_challenge_MA',
@@ -71,7 +69,7 @@ class Challenge:
             if not os.path.exists(os.path.join(self.output_dir, str(episode))):
                 os.makedirs(os.path.join(self.output_dir, str(episode)))
             
-            # 개선: 각 에피소드 폴더에 로그 파일 핸들러 추가
+            # Each episode writes its own log next to its results.
             episode_log_dir = os.path.join(self.output_dir, str(episode))
             episode_file_handler = logging.FileHandler(os.path.join(episode_log_dir, "output.log"))
             episode_file_handler.setLevel(logging.DEBUG)
@@ -192,7 +190,7 @@ class Challenge:
                     except Exception as e:
                         self.logger.error(f"Failed to call check_goal in finally block: {e}")
                         local_finish = (0, 10, False)  # Default fallback
-                # Finally 블록에서 FileHandler 제거 (에피소드 종료 시 항상 실행)
+                # Detach the per-episode handler even if the episode raised.
                 if episode_file_handler in logger.handlers:
                     logger.removeHandler(episode_file_handler)
                     episode_file_handler.close()
@@ -226,18 +224,32 @@ class Challenge:
 def init_logs(output_dir, name = 'simple_example'):
     logger = logging.getLogger(name)
     logger.setLevel(logging.DEBUG)
-    # 개선: 전체 로그 파일은 생성하지 않음 (각 에피소드 폴더에만 로그 생성)
-    # fh = logging.FileHandler(os.path.join(output_dir, "output.log"))
-    # fh.setLevel(logging.DEBUG)
     ch = logging.StreamHandler()
     ch.setLevel(logging.INFO)
 
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    # fh.setFormatter(formatter)
     ch.setFormatter(formatter)
-    # logger.addHandler(fh)  # 전체 로그 파일 핸들러 제거
-    logger.addHandler(ch)  # 콘솔 출력만 유지
+    logger.addHandler(ch)
     return logger
+
+
+def build_vico_config(args) -> ViCoConfig:
+    """Translate the ViCo-Lite command-line flags into a single config object.
+
+    The same instance is handed to the memory hub and to every agent, so a flag
+    cannot silently apply to one and not the other.
+    """
+    cfg = ViCoConfig()
+    if args.symbolic_top_k is not None:
+        cfg.symbolic_top_k = args.symbolic_top_k
+    cfg.heuristic_scoring = not args.no_heuristic_scoring
+    cfg.force_heuristics = not args.enable_llm_reasoner
+    cfg.use_reasoner = args.enable_llm_reasoner
+    for flag, key in (("w_d", "distance"), ("w_n", "novelty"), ("w_v", "visibility")):
+        value = getattr(args, flag, None)
+        if value is not None:
+            cfg.reasoner_heuristic_weights[key] = float(value)
+    return cfg
 
 
 def main():
@@ -273,12 +285,16 @@ def main():
     parser.add_argument("--echo", action='store_true', help="to include prompt in the outputs")
     parser.add_argument("--screen_size", default=512, type=int)
     parser.add_argument("--no_save_img", action='store_true', help="do not save images", default=False)
-    parser.add_argument("--stop_on_first_success", action='store_true', help="end episode after first object reaches goal")
-    parser.add_argument("--symbolic_top_k", default=None, type=int, help="override ViCoConfig.symbolic_top_k (Top-K ablation)")
-    parser.add_argument("--clip_object_ranking", action='store_true', default=False, help="enable per-object CLIP image-name ranking so symbolic_top_k (K) is meaningful (Top-K ablation)")
-    parser.add_argument("--w_d", default=None, type=float, help="override live heuristic weight: distance (reasoner_heuristic_weights['distance'])")
-    parser.add_argument("--w_n", default=None, type=float, help="override live heuristic weight: novelty")
-    parser.add_argument("--w_v", default=None, type=float, help="override live heuristic weight: visibility")
+    parser.add_argument("--stop_on_first_success", action='store_true', help="end the episode after the first object reaches the goal")
+    # ViCo-Lite ablations.
+    vico = parser.add_argument_group("vico_agent")
+    vico.add_argument("--symbolic_top_k", default=None, type=int, help="number of scored objects retained per frame (top-K ablation)")
+    vico.add_argument("--no_shared_memory", action='store_true', help="give each agent its own memory hub instead of a shared one")
+    vico.add_argument("--no_heuristic_scoring", action='store_true', help="rank candidates by distance only, dropping the relevance terms")
+    vico.add_argument("--enable_llm_reasoner", action='store_true', help="enable the optional LLM proposal branch (off in all reported results)")
+    vico.add_argument("--w_d", default=None, type=float, help="candidate score weight: distance")
+    vico.add_argument("--w_n", default=None, type=float, help="candidate score weight: novelty")
+    vico.add_argument("--w_v", default=None, type=float, help="candidate score weight: visibility")
     args = parser.parse_args()
 
     args.number_of_agents = len(args.agents)
@@ -290,31 +306,25 @@ def main():
     logger = init_logs(args.output_dir)
 
     challenge = Challenge(logger, args.port, args.data_path, args.output_dir, args.number_of_agents, args.max_frames, not args.no_launch_build, screen_size = args.screen_size, data_prefix=args.data_prefix, gt_mask = not args.no_gt_mask, save_img = not args.no_save_img, stop_on_first_success = args.stop_on_first_success, seg_dropout = args.seg_dropout)
+    vico_cfg = build_vico_config(args)
+    logger.info("ViCo-Lite config: %s", vico_cfg.as_dict())
+    shared_hub = None if args.no_shared_memory else TeamMemoryHub(vico_cfg)
+
     agents = []
-    shared_vico_hub: Optional[TeamMemoryHub] = None
     for i, agent in enumerate(args.agents):
         if agent == 'h_agent':
             agents.append(H_agent(i, logger, args.max_frames, args.output_dir))
         elif agent == 'lm_agent':
             agents.append(lm_agent(i, logger, args.max_frames, args, args.output_dir))
         elif agent == 'vico_agent':
-            if shared_vico_hub is None:
-                vico_cfg = ViCoConfig()
-                if args.symbolic_top_k is not None:
-                    vico_cfg.symbolic_top_k = args.symbolic_top_k
-                    logger.info(f"[Config] symbolic_top_k overridden to {args.symbolic_top_k}")
-                if args.clip_object_ranking:
-                    vico_cfg.clip_object_ranking = True
-                    logger.info("[Config] clip_object_ranking ENABLED (per-object CLIP top-K ranking)")
-                shared_vico_hub = TeamMemoryHub(vico_cfg)
             agents.append(
                 ViCoAgent(
                     i,
                     logger,
                     args.max_frames,
-                    args,
-                    args.output_dir,
-                    shared_memory_hub=shared_vico_hub,
+                    cfg=vico_cfg,
+                    memory_hub=shared_hub,
+                    output_dir=args.output_dir,
                 )
             )
         else:

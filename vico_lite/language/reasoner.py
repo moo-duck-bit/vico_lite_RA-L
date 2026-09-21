@@ -4,7 +4,6 @@ import json
 import logging
 import os
 import re
-import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -39,17 +38,26 @@ class ReasonerOutput:
 
 
 class PolicyReasoner:
-    """LLM-backed planner with heuristic fallback and optional reflection."""
+    """Deterministic candidate scorer with an optional LLM proposal branch.
+
+    The deterministic path is always available and is the only one exercised in
+    the reported experiments. The LLM branch is entered only when the config
+    enables it and ``force_heuristics`` is off; it proposes candidates that the
+    same deterministic scorer then re-ranks.
+    """
 
     _JSON_FENCE_RE = re.compile(r"```json\s*([\s\S]+?)\s*```", re.IGNORECASE)
 
     def __init__(self, cfg: ViCoConfig) -> None:
         self.cfg = cfg
-        self.client = self._setup_client()
-        self.last_call_ts: float = 0.0
+        self.client = self._setup_client() if self._llm_enabled() else None
+        self.last_call_frame: int = -cfg.reasoner_min_interval
         self._warning_logged: Dict[str, bool] = {}
         self._prompt_template = self._load_prompt_template()
         self._last_signature: Optional[Tuple[str, Optional[Tuple[float, float, float]]]] = None
+
+    def _llm_enabled(self) -> bool:
+        return self.cfg.use_reasoner and not self.cfg.force_heuristics
 
     def _setup_client(self):  # type: ignore[override]
         api_key = os.getenv("OPENAI_API_KEY")
@@ -70,7 +78,7 @@ class PolicyReasoner:
             import httpx
             client = OpenAI(
                 api_key=api_key,
-                timeout=httpx.Timeout(30.0, connect=10.0),  # 30초 타임아웃, 연결 10초
+                timeout=httpx.Timeout(30.0, connect=10.0),
             )
             return client
         except Exception as exc:  # pragma: no cover
@@ -84,19 +92,18 @@ class PolicyReasoner:
         role = context.get("role")
         subgoal = context.get("subgoal")
         source = "heuristic"
-        candidates: List[Dict[str, Any]] = []
 
-        if not force_heuristics and self.cfg.use_reasoner and self.client is not None:
-            now = time.time()
-            cooldown = self.cfg.reasoner_min_interval
-            if now - self.last_call_ts >= cooldown:
+        if not force_heuristics and self._llm_enabled() and self.client is not None:
+            frame = int(context.get("frame", 0))
+            elapsed = frame - self.last_call_frame
+            if elapsed >= self.cfg.reasoner_min_interval:
                 try:
                     candidates = self._query_candidates(context)
                     debug["candidate_count"] = len(candidates)
                     if candidates:
                         plan = self._select_plan(context, candidates)
                         source = "llm"
-                        self.last_call_ts = now
+                        self.last_call_frame = frame
                         if self.cfg.reasoner_reflection and plan is not None:
                             reflection = self._reflect(plan, context)
                             if reflection:
@@ -105,11 +112,11 @@ class PolicyReasoner:
                                 if "reject" in verdict or "retry" in verdict:
                                     debug["reflection_verdict"] = verdict
                                     plan = None
-                except Exception as exc:  # pragma: no cover
+                except Exception as exc:  # pragma: no cover - network failure
                     LOGGER.warning("PolicyReasoner candidates failed (%s)", exc)
                     debug["llm_error"] = str(exc)
             else:
-                debug["cooldown_remaining"] = cooldown - (now - self.last_call_ts)
+                debug["cooldown_remaining"] = self.cfg.reasoner_min_interval - elapsed
 
         if plan is None:
             plan = self._heuristic_plan(context)
@@ -156,7 +163,7 @@ class PolicyReasoner:
             for candidate in candidates:
                 target_pos = candidate.get("target_pos") or candidate.get("target_position")
                 if target_pos and isinstance(target_pos, (list, tuple)) and len(target_pos) >= 3:
-                    x, y, z = float(target_pos[0]), float(target_pos[1]), float(target_pos[2])
+                    x, z = float(target_pos[0]), float(target_pos[2])
                     # Check if within bounds with margin
                     if (x_min is None or x_max is None or (x_min + margin <= x <= x_max - margin)) and \
                        (z_min is None or z_max is None or (z_min + margin <= z <= z_max - margin)):
@@ -241,25 +248,18 @@ class PolicyReasoner:
         ]
 
     def _load_prompt_template(self) -> str:
-        candidate_paths = [
-            os.path.join(os.path.dirname(__file__), "..", "..", "LLM", "prompt_vico_lite_reasoner.txt"),
-            os.path.join(os.getcwd(), "CoELA", "tdw_mat", "LLM", "prompt_vico_lite_reasoner.txt"),
-        ]
-        for path in candidate_paths:
-            norm_path = os.path.abspath(path)
-            if os.path.exists(norm_path):
-                try:
-                    with open(norm_path, "r", encoding="utf-8") as f:
-                        return f.read().strip()
-                except Exception as exc:
-                    LOGGER.warning("PolicyReasoner failed to load prompt template (%s): %s", norm_path, exc)
-        LOGGER.warning("PolicyReasoner using fallback prompt template.")
-        return (
-            "You are a cooperative household robot assistant. Respond with a JSON object containing a"
-            " 'candidates' array. Each candidate must include action, target_id, target_pos, reason,"
-            " confidence, distance, visibility, novelty, role_alignment, penalty. Avoid previously"
-            " skipped targets and keep positions within bounds."
-        )
+        path = os.path.join(os.path.dirname(__file__), "reasoner_prompt.txt")
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                return handle.read().strip()
+        except OSError as exc:
+            LOGGER.warning("PolicyReasoner could not read %s (%s); using a minimal prompt.", path, exc)
+            return (
+                "You are a cooperative household robot assistant. Respond with a JSON object"
+                " containing a 'candidates' array. Each candidate must include action, target_id,"
+                " target_pos, reason, confidence, distance, visibility, novelty, role_alignment"
+                " and penalty. Avoid previously skipped targets and keep positions within bounds."
+            )
 
     def _chat_completion(self, messages: List[Dict[str, str]], context: Optional[Dict[str, Any]] = None) -> Optional[str]:
         if self.client is None:
@@ -540,13 +540,14 @@ class PolicyReasoner:
         best = candidates[0][1]
         target_name = best.get("target_name")
         
-        # 개선: team_symbolic에서 target_id와 target_position 찾기
+        # Resolve the chosen name against the shared object table so the plan
+        # carries a concrete id and position when one is known.
         target_id = None
         target_position = None
         skip_ids = skip_spec.get("ids", set()) if isinstance(skip_spec, dict) else set()
         team_symbolic = context.get("team_symbolic", [])
         if target_name and team_symbolic:
-            # team_symbolic에서 같은 이름의 객체 찾기 (task target 우선)
+            # Prefer task targets, then grabbable objects, then anything with a position.
             best_entry = None
             best_score = -1.0
             for entry in team_symbolic:
@@ -597,18 +598,23 @@ class PolicyReasoner:
         
         return ReasonerPlan(
             action_type=best["action"],
-            target_id=target_id,  # ✅ 개선: target_id 제공
-            target_position=target_position,  # ✅ 개선: target_position 제공 (가능하면)
+            target_id=target_id,
+            target_position=target_position,
             confidence=0.5,
             meta=meta,
         )
 
     def _score_candidate(self, distance: float, similarity: float) -> float:
+        """s(a) = w_d / (d + eps) + (w_n + w_v) * c.
+
+        With ``heuristic_scoring`` disabled the relevance terms drop out and
+        candidates are ranked by inverse distance alone.
+        """
         weights = self.cfg.reasoner_heuristic_weights
-        distance_penalty = weights.get("distance", 1.0) * (1.0 / (distance + 1e-3))
-        novelty = weights.get("novelty", 0.5) * similarity
-        visibility = weights.get("visibility", 0.5) * similarity
-        return distance_penalty + novelty + visibility
+        score = weights.get("distance", 1.0) / (distance + 1e-3)
+        if self.cfg.heuristic_scoring:
+            score += (weights.get("novelty", 0.5) + weights.get("visibility", 0.5)) * similarity
+        return score
 
     # JSON helpers ---------------------------------------------------------------
     def _iter_json_blocks(self, response: Optional[str]) -> Iterable[str]:
