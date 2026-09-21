@@ -65,6 +65,27 @@ class FrozenClipEncoder:
             feature = feature / feature.norm(dim=-1, keepdim=True).clamp(min=1e-6)
             return feature.squeeze(0)
 
+    def encode_texts(self, texts) -> torch.Tensor:
+        """배치 텍스트 인코딩 → (N, dim) 정규화. 텍스트 문자열 단위로 캐시(매 step 동일 객체명 반복 비용 절감)."""
+        if clip is None:
+            raise ImportError(
+                "The 'clip' package is required. Install via pip install git+https://github.com/openai/CLIP.git"
+            )
+        texts = [str(t) for t in texts]
+        if not texts:
+            return torch.empty((0, 0), device=self.device)
+        if not hasattr(self, "_text_cache"):
+            self._text_cache = {}
+        uniq_missing = [t for t in dict.fromkeys(texts) if t not in self._text_cache]
+        if uniq_missing:
+            tokens = clip.tokenize(uniq_missing, truncate=True).to(self.device)
+            with torch.no_grad():
+                feats = self.model.encode_text(tokens)
+                feats = feats / feats.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            for t, f in zip(uniq_missing, feats):
+                self._text_cache[t] = f
+        return torch.stack([self._text_cache[t] for t in texts], dim=0)
+
     def preprocess_image(self, image) -> torch.Tensor:
         array = image
         if isinstance(image, torch.Tensor):

@@ -59,6 +59,9 @@ class ViCoConfig:
     # Symbolic abstraction
     symbolic_vocab_size: int = 512
     symbolic_top_k: int = 5
+    # True면 CLIP이 가시 객체별 image-name 유사도로 top-K를 랭킹 → symbolic_top_k(K)가 실제 동작(Top-K ablation용).
+    # False(기본)면 원본 동작 유지(단일 image-text 스칼라 → 후보 1개).
+    clip_object_ranking: bool = False
 
     # LLM guidance / reasoner
     use_llm_guidance: bool = True
