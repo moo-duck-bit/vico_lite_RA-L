@@ -6,6 +6,7 @@ import unittest
 
 from vico_lite.config import ViCoConfig
 from vico_lite.language.reasoner import PolicyReasoner
+from vico_lite.scoring import candidate_score
 
 
 class CandidateScoreTest(unittest.TestCase):
@@ -45,10 +46,44 @@ class CandidateScoreTest(unittest.TestCase):
         self.assertGreater(gap, margin)
         self.assertGreater(self.score(0.5, 0.0), self.score(5.0, 1.0))
 
+    def test_both_ranking_paths_share_one_implementation(self):
+        weights = self.cfg.reasoner_heuristic_weights
+        self.assertEqual(self.score(2.0, 0.5), candidate_score(2.0, 0.5, weights))
+
     def test_disabling_heuristic_scoring_leaves_pure_distance(self):
         self.cfg.heuristic_scoring = False
         self.assertAlmostEqual(self.score(2.0, 0.9), self.score(2.0, 0.1))
         self.assertAlmostEqual(self.score(2.0, 0.9), 1.5 / (2.0 + 1e-3))
+
+
+class HeuristicPlanTest(unittest.TestCase):
+    def setUp(self):
+        self.reasoner = PolicyReasoner(ViCoConfig())
+
+    def plan(self, candidates, skip_ids=()):
+        return self.reasoner._heuristic_plan({
+            "memory_symbolic": [{"candidates": candidates}],
+            "task_targets": ["apple"],
+            "skip_targets": {"ids": list(skip_ids)},
+        })
+
+    def test_only_task_targets_are_candidates(self):
+        plan = self.plan([
+            {"id": 1, "name": "chair", "distance": 0.5, "score": 0.9},
+            {"id": 2, "name": "apple", "distance": 5.0, "score": 0.1},
+        ])
+        self.assertEqual(plan.target_id, 2)
+
+    def test_highest_score_wins(self):
+        plan = self.plan([
+            {"id": 1, "name": "apple", "distance": 4.0, "score": 0.3},
+            {"id": 2, "name": "apple", "distance": 1.0, "score": 0.3},
+        ])
+        self.assertEqual(plan.target_id, 2)
+
+    def test_skipped_ids_fall_back_to_exploration(self):
+        plan = self.plan([{"id": 2, "name": "apple", "distance": 1.0, "score": 0.3}], skip_ids=[2])
+        self.assertEqual(plan.meta["reason"], "fallback")
 
 
 class LlmBranchTest(unittest.TestCase):

@@ -36,11 +36,11 @@ class MemoryBridgeController:
         self.action_recorder.clear()
         self.hub.register_agent(self.agent_id)
 
-    def process(self, observation: Dict[str, Any]) -> Dict[str, Any]:
+    def process(self, observation: Dict[str, Any], frame: int) -> Dict[str, Any]:
         perception: PerceptionOutput = self.perception.process(
             observation, observation.get("instruction")
         )
-        snapshot: SharedStateSnapshot = self.hub.update(self.agent_id, perception)
+        snapshot: SharedStateSnapshot = self.hub.update(self.agent_id, perception, frame)
         return {"perception": perception, "snapshot": snapshot}
 
     def record_action(self, data: Dict[str, Any]) -> None:

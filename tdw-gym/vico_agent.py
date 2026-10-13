@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import random
 from typing import Any, Dict, Optional
 
 from agent_memory import AgentMemory
@@ -83,6 +84,10 @@ class ViCoAgent:
 
         self.memory_hub.begin_episode(episode_index)
         self.memory_hub.register_agent(self.agent_id)
+        # One seed per (episode, agent): the policy's fallback exploration and
+        # the frontier sampling in AgentMemory.explore are then reproducible.
+        seed = self.cfg.seed + 1000 * (episode_index or 0) + self.agent_id
+        random.seed(seed)
         self.policy = ViCoPolicy(
             self.cfg,
             agent_id=self.agent_id,
@@ -91,6 +96,7 @@ class ViCoAgent:
             memory_hub=self.memory_hub,
             env_api=self.env_api,
             device=self.device,
+            seed=seed,
         )
         self.policy.reset()
         self.policy.set_goal_context(goal_objects=self.goal_objects, rooms_name=self.rooms_name)

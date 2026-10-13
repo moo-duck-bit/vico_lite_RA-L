@@ -15,12 +15,8 @@ from ..execution.executor import PlanExecutor
 from ..language.guidance import GuidanceController, GuidanceResult, ReasonedPlan
 from ..language.reasoner import PolicyReasoner
 from ..memory import MemoryBridgeController, TeamMemoryHub
-
-# Additive bonus that keeps an object required by the task ahead of any other
-# candidate regardless of distance.
-TASK_TARGET_BONUS = 10.0
-# Relevance assumed for an object the encoder did not score this frame.
-DEFAULT_RELEVANCE = 0.2
+from ..memory.hub import OBSTACLE_TTL_FRAMES, quantize, quantize_xz
+from ..scoring import candidate_score
 
 
 class ViCoPolicy:
@@ -35,8 +31,12 @@ class ViCoPolicy:
         memory_hub: TeamMemoryHub,
         env_api: Optional[Dict[str, Any]] = None,
         device: str = "cpu",
+        seed: int = 0,
     ) -> None:
         self.cfg = cfg
+        # Fallback exploration draws from a seeded generator, so a run is
+        # reproducible given the episode and agent.
+        self._rng = random.Random(seed)
         self.agent_id = agent_id
         self.logger = logger
         self.device = device
@@ -169,117 +169,6 @@ class ViCoPolicy:
         # Reset logged failed objects cache for this frame
         self._logged_cal_failed_objects = set()
         
-        # Check for wrong room deliveries: if objects were delivered but not satisfied after 20 frames, retry
-        # This handles cases where objects were delivered to the wrong room
-        # Match on name, not id: two objects of the same name have different ids.
-        if self.env_api and "check_goal" in self.env_api:
-            try:
-                finish_info = self.env_api["check_goal"]()
-                if finish_info and isinstance(finish_info, (tuple, list)) and len(finish_info) >= 2:
-                    pending_deliveries = self.agent_state.get("pending_deliveries", {})
-                    if pending_deliveries:
-                        # Get satisfied object IDs and their names
-                        satisfied_ids = set()
-                        satisfied_names = {}  # {object_id: object_name}
-                        if isinstance(self.env_api, dict) and "env" in self.env_api:
-                            env = self.env_api["env"]
-                            if hasattr(env, "satisfied"):
-                                satisfied_ids = set(env.satisfied.keys())
-                                # Get object names for satisfied objects
-                                if hasattr(env, "target_object_ids") and hasattr(env, "object_manager"):
-                                    for obj_id in satisfied_ids:
-                                        if obj_id in env.object_manager.transforms:
-                                            # Try to get name from object_manager
-                                            try:
-                                                obj_data = env.object_manager.transforms[obj_id]
-                                                if hasattr(obj_data, "name"):
-                                                    satisfied_names[obj_id] = obj_data.name
-                                            except Exception:
-                                                pass
-                        elif hasattr(self.env_api, "satisfied"):
-                            satisfied_ids = set(self.env_api.satisfied.keys())
-                        
-                        # Also get satisfied object names from agent_memory if available
-                        if self.agent_memory and hasattr(self.agent_memory, "object_info"):
-                            for obj_id in satisfied_ids:
-                                if obj_id not in satisfied_names:
-                                    obj_info = self.agent_memory.object_info.get(obj_id)
-                                    if obj_info and obj_info.get("name"):
-                                        satisfied_names[obj_id] = obj_info.get("name")
-                        
-                        # Check each pending delivery by object name (not just ID)
-                        wrong_room_objects = []
-                        confirmed_satisfied = []
-                        for delivered_id, delivery_info in list(pending_deliveries.items()):
-                            # Handle both old format (int) and new format (dict)
-                            if isinstance(delivery_info, dict):
-                                delivery_frame = delivery_info.get("frame", 0)
-                                delivered_name = delivery_info.get("name", "unknown")
-                            else:
-                                # Old format: just frame number
-                                delivery_frame = delivery_info
-                                delivered_name = "unknown"
-                                # Try to get name from agent_memory
-                                if self.agent_memory and hasattr(self.agent_memory, "object_info"):
-                                    obj_info = self.agent_memory.object_info.get(delivered_id)
-                                    if obj_info and obj_info.get("name"):
-                                        delivered_name = obj_info.get("name")
-                            
-                            frames_since_delivery = frame - delivery_frame
-                            
-                            # Check if this specific object_id is satisfied
-                            if delivered_id in satisfied_ids:
-                                confirmed_satisfied.append(delivered_id)
-                                del pending_deliveries[delivered_id]
-                                if self.logger:
-                                    self.logger.debug(
-                                        "[Policy] delivery confirmed satisfied: object id=%s name=%s (removed from pending_deliveries)",
-                                        delivered_id,
-                                        delivered_name,
-                                    )
-                            # Check if any object with the same name is satisfied (for same-name objects with different IDs)
-                            elif delivered_name != "unknown" and satisfied_names:
-                                # Check if any satisfied object has the same name
-                                same_name_satisfied = any(
-                                    name.lower() == delivered_name.lower() 
-                                    for name in satisfied_names.values()
-                                )
-                                if same_name_satisfied:
-                                    # Same name object is satisfied, but not this specific ID
-                                    # This could mean another object with same name was satisfied, or this one was satisfied
-                                    # For safety, we'll keep tracking this ID but log it
-                                    if self.logger:
-                                        self.logger.debug(
-                                            "[Policy] delivery: object id=%s name=%s - same name object satisfied (may be different ID), keeping in pending_deliveries",
-                                            delivered_id,
-                                            delivered_name,
-                                        )
-                            # If 20+ frames have passed and object is not satisfied, it's likely in wrong room
-                            elif frames_since_delivery >= 20:
-                                wrong_room_objects.append(delivered_id)
-                                # Remove from skip_targets
-                                skip_targets = self.agent_state.get("skip_targets", {"names": set(), "coords": set(), "ids": set()})
-                                if isinstance(skip_targets, dict) and "ids" in skip_targets:
-                                    skip_targets["ids"].discard(delivered_id)
-                                    self.agent_state["skip_targets"] = skip_targets
-                                # Remove from verification_removed_ids
-                                verification_removed_ids = self.agent_state.get("verification_removed_ids", set())
-                                verification_removed_ids.discard(delivered_id)
-                                self.agent_state["verification_removed_ids"] = verification_removed_ids
-                                # Remove from pending_deliveries
-                                del pending_deliveries[delivered_id]
-                                if self.logger:
-                                    self.logger.warning(
-                                        "[Policy] wrong room detection: object id=%s name=%s delivered %d frames ago but not satisfied, removing from skip_targets for retry",
-                                        delivered_id,
-                                        delivered_name,
-                                        frames_since_delivery,
-                                    )
-                        if wrong_room_objects or confirmed_satisfied:
-                            self.agent_state["pending_deliveries"] = pending_deliveries
-            except Exception as exc:
-                if self.logger:
-                    self.logger.debug("[Policy] failed to check wrong room deliveries: %s", exc)
         
         prev_status = obs.get("status")
         last_command = self.agent_state.get("last_command")
@@ -447,7 +336,7 @@ class ViCoPolicy:
         self._update_agent_state(obs)
         self.agent_state["frame"] = frame
         perception_input = self._prepare_perception_inputs(obs)
-        bridge_output = self.memory_bridge.process(perception_input)
+        bridge_output = self.memory_bridge.process(perception_input, frame)
         snapshot = bridge_output["snapshot"]
         visible_infos = perception_input.get("object_infos", [])
         self._apply_relevance_scores(visible_infos, snapshot)
@@ -465,9 +354,8 @@ class ViCoPolicy:
             # Mark them occupied so A* routes around what the partner already hit.
             if self.agent_memory is not None and snapshot.obstacle_coords:
                 try:
-                    # Obstacles expire after 120 frames.
                     current_frame = self.agent_state.get("current_frame", frame)
-                    obstacle_ttl = 120
+                    obstacle_ttl = OBSTACLE_TTL_FRAMES
                     valid_obstacle_coords = []
                     for coord, detected_frame in snapshot.obstacle_coords.items():
                         if current_frame - detected_frame < obstacle_ttl:
@@ -1292,8 +1180,8 @@ class ViCoPolicy:
                             if isinstance(agent_arr, np.ndarray) and agent_arr.shape[0] >= 3:
                                 agent_x = float(agent_arr[0])
                                 agent_z = float(agent_arr[2])
-                                angle = random.uniform(0, 2 * math.pi)
-                                distance = random.uniform(3.0, 5.0)
+                                angle = self._rng.uniform(0, 2 * math.pi)
+                                distance = self._rng.uniform(3.0, 5.0)
                                 random_x = agent_x + distance * math.cos(angle)
                                 random_z = agent_z + distance * math.sin(angle)
                                 if hasattr(self.agent_memory, "_scene_bounds"):
@@ -1330,24 +1218,6 @@ class ViCoPolicy:
                             if self.logger:
                                 self.logger.debug("[Policy] random movement fallback failed: %s", exc)
                 
-                # If still idle, try to move to a random position far from current position
-                if explore_plan.action_type == "idle" and current_pos and no_vision_count >= 10:
-                    # Move to a position far from current position (e.g., opposite side of room)
-                    if hasattr(self, 'env_api') and self.env_api:
-                        room_bounds = self.env_api.get("room_bounds")
-                        if room_bounds:
-                            # Move to a random position in the room, far from current position
-                            target_x = random.uniform(room_bounds[0][0], room_bounds[1][0])
-                            target_z = random.uniform(room_bounds[0][2], room_bounds[1][2])
-                            target_pos = (target_x, current_pos[1], target_z)
-                            explore_plan = ReasonedPlan("move", None, target_pos, 0.5, {"reason": "no_vision_for_too_long", "fallback": "random_position"})
-                            if self.logger:
-                                self.logger.info(
-                                    "[Policy] frame=%s no vision for %d frames, moving to random position %s",
-                                    frame,
-                                    no_vision_count,
-                                    target_pos,
-                                )
                 
                 if explore_plan.action_type != "idle":
                     command, exec_meta = self.executor.execute(explore_plan, snapshot, self.agent_state)
@@ -1382,7 +1252,7 @@ class ViCoPolicy:
             if isinstance(key, tuple) and len(key) >= 2:
                 x = float(key[0]) / 10.0 if isinstance(key[0], (int, float)) else float(key[0])
                 z = float(key[1]) / 10.0 if isinstance(key[1], (int, float)) else float(key[1])
-                guard_keys.add((self._quantize_coord(x), self._quantize_coord(z)))
+                guard_keys.add((quantize(x), quantize(z)))
         self.agent_state["nav_guard_coords"] = guard_keys
         if self.team_hub is not None:
             self.team_hub.update_nav_guard(self.agent_id, guard_summary)
@@ -1515,9 +1385,16 @@ class ViCoPolicy:
                         grabbable_names,
                     )
             if not override_used:
-                # Distributed coordination: Each agent independently assigns task_targets to the closest agent
-                # All agents use the same deterministic algorithm, so they all get the same assignment
-                combined_infos = list(visible_infos) if visible_infos else []
+                # Pick candidates come only from the top-K entries kept in shared
+                # memory: this frame's retained objects plus the team table.
+                retained_ids = {
+                    candidate.get("id")
+                    for row in (getattr(snapshot, "symbolic", None) or [])
+                    for candidate in row.get("candidates", [])
+                }
+                combined_infos = [info for info in visible_infos or [] if info.get("id") in retained_ids]
+                # Each agent assigns every task target to the closest agent with the
+                # same deterministic rule, so both agents agree on the split.
                 task_target_assignments: Dict[int, int] = {}  # {obj_id: assigned_agent_id}
                 
                 if snapshot and hasattr(snapshot, "team_symbolic") and snapshot.team_symbolic:
@@ -1666,8 +1543,7 @@ class ViCoPolicy:
                         for info in visible_infos:
                             if info.get("is_task_target") and info.get("is_grabbable"):
                                 obj_id = info.get("id")
-                                if obj_id is not None and task_target_assignments.get(obj_id) == self.agent_id:
-                                    # Already in combined_infos, but ensure it's there
+                                if obj_id in retained_ids and task_target_assignments.get(obj_id) == self.agent_id:
                                     if not any(existing.get("id") == obj_id for existing in combined_infos):
                                         combined_infos.append(info)
                 
@@ -1835,8 +1711,8 @@ class ViCoPolicy:
                                             if isinstance(agent_arr, np.ndarray) and agent_arr.shape[0] >= 3:
                                                 agent_x = float(agent_arr[0])
                                                 agent_z = float(agent_arr[2])
-                                                angle = random.uniform(0, 2 * math.pi)
-                                                distance = random.uniform(2.0, 4.0)
+                                                angle = self._rng.uniform(0, 2 * math.pi)
+                                                distance = self._rng.uniform(2.0, 4.0)
                                                 random_x = agent_x + distance * math.cos(angle)
                                                 random_z = agent_z + distance * math.sin(angle)
                                                 if hasattr(self.agent_memory, "_scene_bounds"):
@@ -1976,8 +1852,8 @@ class ViCoPolicy:
                         if isinstance(agent_arr, np.ndarray) and agent_arr.shape[0] >= 3:
                             agent_x = float(agent_arr[0])
                             agent_z = float(agent_arr[2])
-                            angle = random.uniform(0, 2 * math.pi)
-                            distance = random.uniform(2.0, 4.0)
+                            angle = self._rng.uniform(0, 2 * math.pi)
+                            distance = self._rng.uniform(2.0, 4.0)
                             random_x = agent_x + distance * math.cos(angle)
                             random_z = agent_z + distance * math.sin(angle)
                             if hasattr(self.agent_memory, "_scene_bounds"):
@@ -2267,22 +2143,6 @@ class ViCoPolicy:
                 explore_plan = ReasonedPlan("search", None, None, 0.5, {"reason": "invalid_target_position_fallback"})
                 explore_plan = self._ensure_plan_target(explore_plan)
                 
-                # If still idle, try random position
-                if explore_plan.action_type == "idle" and current_pos and invalid_pos_count >= 8:
-                    if hasattr(self, 'env_api') and self.env_api:
-                        room_bounds = self.env_api.get("room_bounds")
-                        if room_bounds:
-                            target_x = random.uniform(room_bounds[0][0], room_bounds[1][0])
-                            target_z = random.uniform(room_bounds[0][2], room_bounds[1][2])
-                            target_pos = (target_x, current_pos[1], target_z)
-                            explore_plan = ReasonedPlan("move", None, target_pos, 0.5, {"reason": "invalid_target_position_fallback", "fallback": "random_position"})
-                            if self.logger:
-                                self.logger.info(
-                                    "[Policy] frame=%s invalid_target_position %d times, moving to random position %s",
-                                    frame,
-                                    invalid_pos_count,
-                                    target_pos,
-                                )
                 
                 if explore_plan.action_type != "idle":
                     command, exec_meta = self.executor.execute(explore_plan, snapshot, self.agent_state)
@@ -2825,39 +2685,12 @@ class ViCoPolicy:
                 verification_removed_set.update(previous_holding_ids)
                 self.agent_state["verification_removed_ids"] = verification_removed_set
                 
-                # skip them by id as well as by verification.
-                # This prevents the policy from trying to pick up objects that have already been delivered
-                # Use object_id instead of name to avoid skipping other objects with the same name
-                # Also track delivery frame and object name for wrong room detection
-                current_frame = obs.get("current_frames", 0)
-                pending_deliveries = self.agent_state.setdefault("pending_deliveries", {})  # {object_id: {"frame": int, "name": str}}
+                # Skip delivered objects by id, not by name: another object with
+                # the same name may still be needed.
                 for delivered_id in previous_holding_ids:
-                    # Register by object_id (not name) to avoid skipping other objects with the same name
                     self._register_skip_target(object_id=delivered_id)
-                    # Get object name for tracking
-                    obj_name = None
-                    if self.agent_memory and hasattr(self.agent_memory, "object_info"):
-                        obj_info = self.agent_memory.object_info.get(delivered_id)
-                        if obj_info:
-                            obj_name = obj_info.get("name")
-                    if not obj_name and held_objects:
-                        for entry in held_objects:
-                            if entry and entry.get("id") == delivered_id:
-                                obj_name = entry.get("name")
-                                break
-                    # Track delivery frame and object name for wrong room detection (will be verified after 20 frames)
-                    pending_deliveries[delivered_id] = {
-                        "frame": current_frame,
-                        "name": obj_name or "unknown",
-                    }
-                    if self.logger:
-                        self.logger.info(
-                            "[Policy] deliver success: added delivered object to skip_targets id=%s name=%s (tracking for wrong room detection, delivery_frame=%d)",
-                            delivered_id,
-                            obj_name or "unknown",
-                            current_frame,
-                        )
-                self.agent_state["pending_deliveries"] = pending_deliveries
+                if self.logger:
+                    self.logger.info("[Policy] deliver success: skip ids += %s", previous_holding_ids)
                 
                 if self.logger:
                     self.logger.info(
@@ -2967,9 +2800,8 @@ class ViCoPolicy:
         shared_obstacle_coords = set()
         obstacle_coords_dict = self.agent_state.get("shared_obstacle_coords", {})
         if obstacle_coords_dict:
-            # Obstacles expire after 120 frames.
             current_frame = self.agent_state.get("current_frame", 0)
-            obstacle_ttl = 120
+            obstacle_ttl = OBSTACLE_TTL_FRAMES
             valid_obstacles = []
             for coord, detected_frame in obstacle_coords_dict.items():
                 if current_frame - detected_frame < obstacle_ttl:
@@ -3276,7 +3108,7 @@ class ViCoPolicy:
                         blocked_coords_for_search.add((last_x, last_z))
                 
                 # A random starting angle keeps successive searches from repeating.
-                start_angle = random.uniform(0, 360)
+                start_angle = self._rng.uniform(0, 360)
                 angles = [start_angle + i * 45 for i in range(8)]
                 angles = [a % 360 for a in angles]
                 
@@ -3336,7 +3168,7 @@ class ViCoPolicy:
                     max_radius = 8.0
                     found_valid = False
                     # A random starting angle keeps successive searches from repeating.
-                    start_angle_16 = random.uniform(0, 360)
+                    start_angle_16 = self._rng.uniform(0, 360)
                     angles_16 = [start_angle_16 + i * 22.5 for i in range(16)]
                     angles_16 = [a % 360 for a in angles_16]
                     
@@ -3439,7 +3271,7 @@ class ViCoPolicy:
                 # otherwise the move completes without going anywhere.
                 if distance_to_target < 0.01:
                     # Coincident positions get a random direction.
-                    angle = random.uniform(0, 2 * math.pi)
+                    angle = self._rng.uniform(0, 2 * math.pi)
                 else:
                     dx = target_x - current_x
                     dz = target_z - current_z
@@ -3553,20 +3385,12 @@ class ViCoPolicy:
                 info["score"] = score
 
     def _candidate_score(self, distance: Optional[float], relevance: Optional[float]) -> float:
-        """s(a) = w_d / (d + eps) + (w_n + w_v) * c, as used to rank candidates."""
-        weights = self.cfg.reasoner_heuristic_weights
-        try:
-            d = max(float(distance), 0.0)
-        except (TypeError, ValueError):
-            d = 1.0
-        score = weights.get("distance", 1.5) / (d + 1e-3)
-        if self.cfg.heuristic_scoring:
-            try:
-                c = float(relevance)
-            except (TypeError, ValueError):
-                c = DEFAULT_RELEVANCE
-            score += (weights.get("novelty", 0.8) + weights.get("visibility", 0.6)) * c
-        return score
+        return candidate_score(
+            distance,
+            relevance,
+            self.cfg.reasoner_heuristic_weights,
+            use_relevance=self.cfg.heuristic_scoring,
+        )
 
     # ------------------------------------------------------------------
     def _register_skip_target(self, name: Optional[str] = None, position: Optional[Tuple[float, float, float]] = None, object_id: Optional[int] = None) -> None:
@@ -3577,7 +3401,7 @@ class ViCoPolicy:
         if name:
             names_set.add(str(name).lower())
         if position is not None:
-            coords_set.add(self._coord_key(position))
+            coords_set.add(quantize_xz(position))
         if object_id is not None:
             ids_set.add(int(object_id))
         store["names"] = names_set
@@ -3591,12 +3415,6 @@ class ViCoPolicy:
         store = self.agent_state.get("skip_targets", {})
         return set(store.get("coords", set())) if isinstance(store, dict) else set()
 
-    @staticmethod
-    def _quantize_coord(value: float, step: float = 0.5) -> float:
-        if step <= 0:
-            return round(value, 2)
-        return round(round(value / step) * step, 2)
-
     def _is_blocked_position(self, position: Tuple[float, float, float], blocked_coords: set, radius: float = 0.6) -> bool:
         if position is None:
             return False
@@ -3605,32 +3423,14 @@ class ViCoPolicy:
             z = float(position[2])
         except Exception:
             return False
-        qx = self._quantize_coord(x)
-        qz = self._quantize_coord(z)
+        qx = quantize(x)
+        qz = quantize(z)
         if (qx, qz) in blocked_coords:
             return True
         for bx, bz in blocked_coords:
             if abs(bx - qx) <= radius and abs(bz - qz) <= radius:
                 return True
         return False
-
-    @staticmethod
-    def _coord_key(position: Tuple[float, float, float]) -> Tuple[float, float]:
-        if isinstance(position, (list, tuple)):
-            if len(position) >= 3:
-                x = position[0]
-                z = position[2]
-            elif len(position) == 2:
-                x = position[0]
-                z = position[1]
-            else:
-                raise ValueError("Position sequence must have length >= 2")
-        else:  # type: ignore[unreachable]
-            raise ValueError("Position must be list or tuple")
-        return (
-            ViCoPolicy._quantize_coord(float(x)),
-            ViCoPolicy._quantize_coord(float(z)),
-        )
 
     # ------------------------------------------------------------------
     def _load_name_map(self) -> Dict[str, str]:
@@ -3684,11 +3484,14 @@ class ViCoPolicy:
             except Exception:
                 pass
         blocked_coords = self._skip_coords().union(self.agent_state.get("nav_guard_coords", set()))
-        skip_names = {
-            str(name).lower()
-            for name in self.agent_state.get("skip_targets", {}).get("names", set())
-        }
         skip_ids = self.agent_state.get("skip_targets", {}).get("ids", set())
+        # Task status q_j from the shared object table: targets the partner has
+        # delivered or given up on are not candidates either.
+        team_done_ids = {
+            entry.get("id")
+            for entry in (getattr(snapshot, "team_symbolic", None) or [])
+            if entry.get("status") == "done"
+        }
         # Get holding_ids to exclude already held objects
         holding_ids = set(self.agent_state.get("holding_ids", []))
         # Note: Task target assignment to closest agent is already done in act() before calling this function
@@ -3696,8 +3499,10 @@ class ViCoPolicy:
         candidates: List[Tuple[float, Dict[str, Any]]] = []
         filtered_reasons: Dict[str, int] = {}
         for info in object_infos:
-            if not info.get("is_grabbable"):
-                filtered_reasons["not_grabbable"] = filtered_reasons.get("not_grabbable", 0) + 1
+            # Pick candidates are generated for task targets only; everything
+            # else is filtered before scoring (Sec. III-D).
+            if not (info.get("is_grabbable") and info.get("is_task_target")):
+                filtered_reasons["not_task_target"] = filtered_reasons.get("not_task_target", 0) + 1
                 continue
             obj_id = info.get("id")
             if obj_id is None:
@@ -3795,8 +3600,6 @@ class ViCoPolicy:
                                         filtered_reasons["invalid_position"] = filtered_reasons.get("invalid_position", 0) + 1
                                         obj_name = obj_info.get("name")
                                         if obj_name:
-                                            skip_names.add(str(obj_name).lower())
-                                            # Skip it so it is not retried.
                                             self._register_skip_target(name=str(obj_name).lower())
                                         continue
                         except Exception:
@@ -3869,7 +3672,6 @@ class ViCoPolicy:
                     filtered_reasons["invalid_position"] = filtered_reasons.get("invalid_position", 0) + 1
                     obj_name = info.get("name")
                     if obj_name:
-                        skip_names.add(str(obj_name).lower())
                         self._register_skip_target(name=str(obj_name).lower())
                     continue
             
@@ -3967,45 +3769,20 @@ class ViCoPolicy:
                 filtered_reasons["no_distance"] = filtered_reasons.get("no_distance", 0) + 1
                 continue
             distance = float(info["distance"])
-            # Increase max_distance to allow navigation to objects
-            # For task targets: allow unlimited distance (executor will navigate) - prioritize task targets heavily
-            # For other grabbables: allow up to 8m (executor will navigate)
-            is_task_target = info.get("is_task_target", False)
-            max_distance = float('inf') if is_task_target else 8.0
-            if not np.isfinite(distance) or (not is_task_target and distance > max_distance):
-                # For task targets, always allow (distance can be any value)
-                if not is_task_target:
-                    filtered_reasons["too_far"] = filtered_reasons.get("too_far", 0) + 1
-                    continue
-                # For task targets, if distance is not finite, still allow (will navigate)
-                elif not np.isfinite(distance):
-                    # Use a default large distance for task targets without valid distance
-                    distance = 50.0
-                    info["distance"] = distance
+            if not np.isfinite(distance):
+                # The executor navigates to far targets, so keep them with a large distance.
+                distance = 50.0
+                info["distance"] = distance
             # Skip blocked check if position is None (estimated from depth)
             if position is not None and self._is_blocked_position(position, blocked_coords, radius=0.4):
                 filtered_reasons["blocked"] = filtered_reasons.get("blocked", 0) + 1
                 continue
-            # Check skip_ids first (more specific - only skips the exact object that was delivered)
-            # Task targets bypass the skip list: another object of the same name may still be needed.
-            is_task_target = info.get("is_task_target", False)
-            if obj_id is not None and obj_id in skip_ids and not is_task_target:
+            # A delivered target is skipped by id, never by name: another object
+            # with the same name may still be needed.
+            if obj_id in skip_ids or obj_id in team_done_ids:
                 filtered_reasons["skip_id"] = filtered_reasons.get("skip_id", 0) + 1
                 continue
-            # Check skip_names (less specific - skips all objects with the same name)
-            # BUT: Skip this check for task targets - we may need to pick other objects with the same name
-            # Only skip by name if it's NOT a task target (task targets are allowed even if same name was delivered before)
-            if not is_task_target:
-                name_lc = str(info.get("name", "")).lower()
-                if name_lc in skip_names:
-                    filtered_reasons["skip_name"] = filtered_reasons.get("skip_name", 0) + 1
-                    continue
-            # Task target assignment already happened in act(); only objects
-            # assigned to this agent reach here.
-            score = self._candidate_score(distance, info.get("score"))
-            if is_task_target:
-                score += TASK_TARGET_BONUS
-            candidates.append((score, info))
+            candidates.append((self._candidate_score(distance, info.get("score")), info))
         if not candidates:
             if self.logger and filtered_reasons:
                 self.logger.debug(
@@ -4019,16 +3796,6 @@ class ViCoPolicy:
         target_pos = self._normalise_position(best_info.get("position"))
         if target_id is None:
             return None
-        # Only task targets are ever picked up.
-        if not best_info.get("is_task_target", False):
-            if self.logger:
-                self.logger.debug(
-                    "[Policy] _maybe_force_pick: skipping non-task-target object id=%s name=%s (task targets only)",
-                    target_id,
-                    best_info.get("name"),
-                )
-            return None
-        # No position, but depth still gives a range: that is enough to attempt a
         use_reach_for = best_info.get("use_reach_for", False)
         needs_navigation = best_info.get("needs_navigation", False)
         
@@ -4507,50 +4274,7 @@ class ViCoPolicy:
                         # Try to get position from env_api if not in memory
                         if goal_pos is None and self.env_api is not None:
                             # Try to get position from env_api using get_goal_position function
-                            try:
-                                if isinstance(self.env_api, dict):
-                                    # First try get_goal_position (most direct)
-                                    if "get_goal_position" in self.env_api:
-                                        goal_pos = self.env_api["get_goal_position"]()
-                                        if goal_pos is not None:
-                                            goal_pos = self._normalise_position(goal_pos)
-                                            if self.logger:
-                                                self.logger.info(
-                                                    "[Policy] _maybe_force_deliver: got goal_position_id=%s position from env_api.get_goal_position: %s",
-                                                    goal_position_id,
-                                                    goal_pos,
-                                                )
-                                    # Fallback: try get_object_list
-                                    elif "get_object_list" in self.env_api:
-                                        obj_list = self.env_api["get_object_list"]()
-                                        for obj in obj_list:
-                                            if obj.get("id") == goal_position_id:
-                                                goal_pos = self._normalise_position(obj.get("position"))
-                                                goal_name = str(obj.get("name", "goal_position"))
-                                                break
-                                elif hasattr(self.env_api, "get_goal_position"):
-                                    goal_pos = self.env_api.get_goal_position()
-                                    if goal_pos is not None:
-                                        goal_pos = self._normalise_position(goal_pos)
-                                        if self.logger:
-                                            self.logger.info(
-                                                "[Policy] _maybe_force_deliver: got goal_position_id=%s position from env_api.get_goal_position: %s",
-                                                goal_position_id,
-                                                goal_pos,
-                                            )
-                                elif hasattr(self.env_api, "get_object_list"):
-                                    obj_list = self.env_api.get_object_list()
-                                    for obj in obj_list:
-                                        if obj.get("id") == goal_position_id:
-                                            goal_pos = self._normalise_position(obj.get("position"))
-                                            goal_name = str(obj.get("name", "goal_position"))
-                                            break
-                            except Exception as exc:
-                                if self.logger:
-                                    self.logger.debug(
-                                        "[Policy] _maybe_force_deliver: failed to get goal_position_id position from env_api: %s",
-                                        exc,
-                                    )
+                            goal_pos = self._env_goal_position()
                         
                         # Add goal_position_id to candidates with highest priority (distance = -1)
                         # Even if position is None, add it with a placeholder position (will use env_api position later)
@@ -4611,40 +4335,9 @@ class ViCoPolicy:
                         # Try to get actual position from env_api if placeholder was used
                         if best_pos == (0.0, 0.0, 0.0) or (agent_pos is not None and np.allclose(best_pos, agent_pos)):
                             # Placeholder position was used, try to get real position from env_api
-                            try:
-                                if isinstance(self.env_api, dict):
-                                    # First try get_goal_position (most direct)
-                                    if "get_goal_position" in self.env_api:
-                                        real_pos = self.env_api["get_goal_position"]()
-                                        if real_pos is not None:
-                                            real_pos = self._normalise_position(real_pos)
-                                            if real_pos is not None:
-                                                best_pos = real_pos
-                                    # Fallback: try get_object_list
-                                    elif "get_object_list" in self.env_api:
-                                        obj_list = self.env_api["get_object_list"]()
-                                        for obj in obj_list:
-                                            if obj.get("id") == goal_position_id:
-                                                real_pos = self._normalise_position(obj.get("position"))
-                                                if real_pos is not None:
-                                                    best_pos = real_pos
-                                                    break
-                                elif hasattr(self.env_api, "get_goal_position"):
-                                    real_pos = self.env_api.get_goal_position()
-                                    if real_pos is not None:
-                                        real_pos = self._normalise_position(real_pos)
-                                        if real_pos is not None:
-                                            best_pos = real_pos
-                                elif hasattr(self.env_api, "get_object_list"):
-                                    obj_list = self.env_api.get_object_list()
-                                    for obj in obj_list:
-                                        if obj.get("id") == goal_position_id:
-                                            real_pos = self._normalise_position(obj.get("position"))
-                                            if real_pos is not None:
-                                                best_pos = real_pos
-                                                break
-                            except Exception:
-                                pass
+                            real_pos = self._env_goal_position()
+                            if real_pos is not None:
+                                best_pos = real_pos
                         
                         try:
                             pos_arr = np.asarray(best_pos, dtype=np.float32)
@@ -4868,6 +4561,17 @@ class ViCoPolicy:
                 best_info.get("distance", -1.0),
             )
         return ReasonedPlan("deliver", target_id, target_pos, confidence, meta)
+
+    def _env_goal_position(self) -> Optional[Tuple[float, float, float]]:
+        """Position of the designated goal receptacle as provided by the environment.
+
+        This is the only object whose position is not estimated from depth
+        (Sec. III-A).
+        """
+        getter = self.env_api.get("get_goal_position") if self.env_api else None
+        if getter is None:
+            return None
+        return self._normalise_position(getter())
 
     @staticmethod
     def _normalise_position(position: Any) -> Optional[Tuple[float, float, float]]:

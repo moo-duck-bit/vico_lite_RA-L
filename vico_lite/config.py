@@ -37,19 +37,17 @@ class ViCoConfig:
 
     # Frozen visual encoders.
     clip_model: str = "ViT-B/32"
-    clip_dim: int = 512
     kosmos_model: str = "microsoft/kosmos-2-patch14-224"
-    kosmos_dim: int = 0  # 0 disables the optional Kosmos-2 auxiliary features.
+    use_kosmos: bool = False  # Optional Kosmos-2 features on retained candidates; off by default.
 
     # Number of scored objects retained per frame.
     symbolic_top_k: int = 5
 
     # Shared memory.
-    memory_ema_decay: float = 0.9  # Team latent EMA, alpha in m_t = a*m_{t-1} + (1-a)*g_t.
-    object_memory_decay: float = 0.5  # Blend of stored vs. incoming object position/score.
-    memory_max_history: int = 50
+    object_memory_decay: float = 0.5  # Temporal smoothing of stored vs. incoming position/score.
 
     # Deterministic policy.
+    seed: int = 0  # Seeds the fallback-exploration RNG of every agent.
     heuristic_scoring: bool = True  # False falls back to pure distance ranking.
     force_heuristics: bool = True  # True issues no LLM call during execution.
 
@@ -72,11 +70,6 @@ class ViCoConfig:
     reasoner_heuristic_weights: Dict[str, float] = field(default_factory=_default_heuristic_weights)
     action_whitelist: Optional[List[str]] = field(default_factory=_default_action_whitelist)
     action_blacklist: List[str] = field(default_factory=list)
-
-    @property
-    def latent_dim(self) -> int:
-        """Width of concat(image embedding, text embedding, auxiliary features)."""
-        return 2 * self.clip_dim + max(0, self.kosmos_dim)
 
     def as_dict(self) -> Dict[str, Any]:
         return {name: getattr(self, name) for name in self.__dataclass_fields__}

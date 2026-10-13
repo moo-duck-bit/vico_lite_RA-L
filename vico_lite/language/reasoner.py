@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 import numpy as np
 
 from ..config import ViCoConfig
+from ..scoring import candidate_score
 
 try:
     from openai import OpenAI
@@ -515,106 +516,45 @@ class PolicyReasoner:
         return plan
 
     def _heuristic_plan(self, context: Dict[str, Any]) -> ReasonerPlan:
-        symbolic = context.get("memory_symbolic", [])
+        """Rank this frame's top-K task targets by s(a); explore when there is none."""
         skip_spec = context.get("skip_targets", {}) or {}
-        skip_names = {str(name).lower() for name in skip_spec.get("names", [])}
+        skip_ids = set(skip_spec.get("ids", []))
         task_targets = {str(name).lower() for name in context.get("task_targets", [])}
         candidates: List[Tuple[float, Dict[str, Any]]] = []
-        for entry in symbolic:
+        for entry in context.get("memory_symbolic", []):
             for candidate in entry.get("candidates", []):
-                name = candidate.get("name")
-                score = float(candidate.get("score", 0.0))
-                if isinstance(name, str) and name.lower() in skip_names:
+                if str(candidate.get("name", "")).lower() not in task_targets:
                     continue
-                distance = float(candidate.get("distance", 1.0))
-                heur_score = self._score_candidate(distance=distance, similarity=score)
-                # prefer task targets
-                if isinstance(name, str) and name.lower() in task_targets:
-                    heur_score += 2.0
-                elif task_targets:
-                    heur_score -= 0.5
-                candidates.append((heur_score, {"action": "search", "target_name": name, "distance": distance}))
+                if candidate.get("id") in skip_ids:
+                    continue
+                score = self._score_candidate(candidate.get("distance"), candidate.get("score"))
+                candidates.append((score, candidate))
         if not candidates:
             return ReasonerPlan("search", None, None, 0.3, {"reason": "fallback"})
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        best = candidates[0][1]
-        target_name = best.get("target_name")
-        
-        # Resolve the chosen name against the shared object table so the plan
-        # carries a concrete id and position when one is known.
-        target_id = None
+
+        score, best = max(candidates, key=lambda item: item[0])
         target_position = None
-        skip_ids = skip_spec.get("ids", set()) if isinstance(skip_spec, dict) else set()
-        team_symbolic = context.get("team_symbolic", [])
-        if target_name and team_symbolic:
-            # Prefer task targets, then grabbable objects, then anything with a position.
-            best_entry = None
-            best_score = -1.0
-            for entry in team_symbolic:
-                entry_name = entry.get("name")
-                if not entry_name or str(entry_name).lower() != target_name.lower():
-                    continue
-                # Skip if in skip_ids
-                entry_id = entry.get("id")
-                if entry_id is not None and entry_id in skip_ids:
-                    continue
-                # Prefer task targets and grabbable objects
-                entry_score = 0.0
-                if entry.get("is_task_target"):
-                    entry_score += 10.0
-                if entry.get("is_grabbable"):
-                    entry_score += 5.0
-                # Prefer entries with position information
-                if entry.get("position") is not None or entry.get("location") is not None:
-                    entry_score += 2.0
-                if entry_score > best_score:
-                    best_score = entry_score
-                    best_entry = entry
-            
-            if best_entry:
-                target_id = best_entry.get("id")
-                # Try to get position from entry (but Policy will validate it)
-                target_position = best_entry.get("position") or best_entry.get("location")
-                # Normalize position format
-                if target_position is not None:
-                    if isinstance(target_position, (list, tuple)) and len(target_position) >= 3:
-                        # Ensure it's a tuple of floats
-                        try:
-                            target_position = (float(target_position[0]), float(target_position[1]), float(target_position[2]))
-                        except (ValueError, TypeError, IndexError):
-                            target_position = None
-                    else:
-                        target_position = None
-        
-        meta = {
-            "reason": "heuristic",
-            "score": candidates[0][0],
-            "target_name": target_name,
-        }
-        if target_id is not None:
-            meta["target_id"] = target_id
-        if target_position is not None:
-            meta["target_position_source"] = "team_symbolic"
-        
+        position = best.get("position")
+        if isinstance(position, (list, tuple)) and len(position) >= 3:
+            target_position = tuple(float(value) for value in position[:3])
+        meta: Dict[str, Any] = {"reason": "heuristic", "score": score, "target_name": best.get("name")}
+        if best.get("id") is not None:
+            meta["target_id"] = best["id"]
         return ReasonerPlan(
-            action_type=best["action"],
-            target_id=target_id,
+            action_type="search",
+            target_id=best.get("id"),
             target_position=target_position,
             confidence=0.5,
             meta=meta,
         )
 
-    def _score_candidate(self, distance: float, similarity: float) -> float:
-        """s(a) = w_d / (d + eps) + (w_n + w_v) * c.
-
-        With ``heuristic_scoring`` disabled the relevance terms drop out and
-        candidates are ranked by inverse distance alone.
-        """
-        weights = self.cfg.reasoner_heuristic_weights
-        score = weights.get("distance", 1.0) / (distance + 1e-3)
-        if self.cfg.heuristic_scoring:
-            score += (weights.get("novelty", 0.5) + weights.get("visibility", 0.5)) * similarity
-        return score
+    def _score_candidate(self, distance: Optional[float], similarity: Optional[float]) -> float:
+        return candidate_score(
+            distance,
+            similarity,
+            self.cfg.reasoner_heuristic_weights,
+            use_relevance=self.cfg.heuristic_scoring,
+        )
 
     # JSON helpers ---------------------------------------------------------------
     def _iter_json_blocks(self, response: Optional[str]) -> Iterable[str]:

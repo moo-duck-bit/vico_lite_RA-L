@@ -1,8 +1,7 @@
 """Grounding tests that do not need CLIP weights or the TDW build.
 
 The CLIP encoder is replaced by a deterministic stub so the tests exercise the
-region proposal, the top-K selection and the latent assembly rather than the
-pretrained model.
+region proposal and the top-K selection rather than the pretrained model.
 """
 
 from __future__ import annotations
@@ -108,15 +107,15 @@ class PipelineTest(unittest.TestCase):
         self.cfg.symbolic_top_k = 1
         self.assertEqual(len(self._process().symbolic[0]["candidates"]), 1)
 
-    def test_latent_width_matches_config(self):
-        self.assertEqual(self._process().agent_summary.shape, (self.cfg.latent_dim,))
-
     def test_blind_frame_is_handled(self):
         output = self.pipeline.process(
             {"rgb": self.rgb, "seg_mask": None, "object_infos": []}, "x"
         )
         self.assertEqual(output.symbolic[0]["candidates"], [])
-        self.assertEqual(output.agent_summary.shape, (self.cfg.latent_dim,))
+
+    def test_kosmos_is_off_by_default(self):
+        self.assertIsNone(self.pipeline.kosmos)
+        self.assertNotIn("kosmos_feature", self._process().symbolic[0]["candidates"][0])
 
 
 if __name__ == "__main__":

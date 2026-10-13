@@ -245,6 +245,7 @@ def build_vico_config(args) -> ViCoConfig:
     cfg.heuristic_scoring = not args.no_heuristic_scoring
     cfg.force_heuristics = not args.enable_llm_reasoner
     cfg.use_reasoner = args.enable_llm_reasoner
+    cfg.seed = args.seed
     for flag, key in (("w_d", "distance"), ("w_n", "novelty"), ("w_v", "visibility")):
         value = getattr(args, flag, None)
         if value is not None:
@@ -292,6 +293,7 @@ def main():
     vico.add_argument("--no_shared_memory", action='store_true', help="give each agent its own memory hub instead of a shared one")
     vico.add_argument("--no_heuristic_scoring", action='store_true', help="rank candidates by distance only, dropping the relevance terms")
     vico.add_argument("--enable_llm_reasoner", action='store_true', help="enable the optional LLM proposal branch (off in all reported results)")
+    vico.add_argument("--seed", default=0, type=int, help="seed of the policy's fallback exploration")
     vico.add_argument("--w_d", default=None, type=float, help="candidate score weight: distance")
     vico.add_argument("--w_n", default=None, type=float, help="candidate score weight: novelty")
     vico.add_argument("--w_v", default=None, type=float, help="candidate score weight: visibility")
